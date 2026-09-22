@@ -108,7 +108,7 @@ func TestDrainPinProbe(t *testing.T) {
 	}
 	t.Logf("working set written in %s", time.Since(start).Round(time.Millisecond))
 
-	probeRounds(t, fx, ctx, "bulk", rounds)
+	probeRounds(t, fx, ctx, "bulk", rounds, true)
 
 	// Phase 2 is the shape the cold barrier actually meets and the one #2822 is
 	// about: a drained store plus a small uncarved tail. dfsbench writes its
@@ -128,12 +128,43 @@ func TestDrainPinProbe(t *testing.T) {
 			t.Fatalf("tail commit %q: %v", name, err)
 		}
 	}
-	probeRounds(t, fx, ctx, "tail", rounds)
+	// Sample only: draining here would carry the tail to the remote and
+	// dissolve the very pin phase 3 exists to observe.
+	probeRounds(t, fx, ctx, "tail", 1, false)
+
+	// PinnedBytes is a claim about what eviction cannot reclaim, so it has to be
+	// checked against eviction while the pinned state still exists. Evicting
+	// after a drain proves nothing: the drain carries the tail to the remote,
+	// the pin dissolves, and eviction then frees everything — a green result
+	// that never met the condition under test.
+	t.Log("--- phase 3: does eviction actually leave PinnedBytes behind? ---")
+	pre := fx.bs.GetStatsLite()
+	if pre.PinnedBytes == 0 {
+		t.Fatalf("nothing pinned before the evict pass, so this phase would be vacuous")
+	}
+	res, err := fx.bs.DrainLocalSynced(ctx)
+	if err != nil {
+		t.Fatalf("DrainLocalSynced: %v", err)
+	}
+	post := fx.bs.GetStatsLite()
+	t.Logf("before evict: resident=%dMiB pinned_segs=%d pinned=%dMiB",
+		pre.LocalDiskUsed>>20, pre.PinnedSegments, pre.PinnedBytes>>20)
+	t.Logf("evict freed %d segments / %dMiB (held=%v)",
+		res.SegmentsEvicted, res.BytesFreed>>20, res.Held)
+	t.Logf("after evict:  resident=%dMiB pinned_segs=%d pinned=%dMiB",
+		post.LocalDiskUsed>>20, post.PinnedSegments, post.PinnedBytes>>20)
+	t.Logf("VERDICT: counter claimed %d bytes unreclaimable; eviction left %d behind (delta %d)",
+		pre.PinnedBytes, post.LocalDiskUsed, post.LocalDiskUsed-pre.PinnedBytes)
+
+	// Only now drain, so the run leaves nothing stranded in the bucket.
+	if err := fx.bs.DrainAllUploads(ctx); err != nil {
+		t.Fatalf("post-evict drain: %v", err)
+	}
 }
 
 // probeRounds samples the residue against what it actually pins, drains, and
 // repeats until the residue reaches zero or the rounds run out.
-func probeRounds(t *testing.T, fx *byteVerifyFixture, ctx context.Context, phase string, rounds int) {
+func probeRounds(t *testing.T, fx *byteVerifyFixture, ctx context.Context, phase string, rounds int, drain bool) {
 	t.Helper()
 	t.Logf("phase\tround\tunsynced_MiB\tresident_MiB\tsegs\tpinned_segs\tpinned_MiB\tworst_segs\tworst_MiB\tratio\tbarrier_ok")
 	for round := 0; round < rounds; round++ {
@@ -171,6 +202,9 @@ func probeRounds(t *testing.T, fx *byteVerifyFixture, ctx context.Context, phase
 		if st.UnsyncedBytes == 0 {
 			t.Logf("residue reached zero at round %d", round)
 			break
+		}
+		if !drain {
+			return
 		}
 
 		drainStart := time.Now()
