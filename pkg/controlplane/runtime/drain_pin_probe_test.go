@@ -14,6 +14,7 @@ import (
 	"github.com/marmos91/dittofs/internal/adapter/common"
 	"github.com/marmos91/dittofs/pkg/block/chunker"
 	"github.com/marmos91/dittofs/pkg/controlplane/models"
+	"github.com/marmos91/dittofs/pkg/metadata"
 	metadatamemory "github.com/marmos91/dittofs/pkg/metadata/store/memory"
 )
 
@@ -107,7 +108,34 @@ func TestDrainPinProbe(t *testing.T) {
 	}
 	t.Logf("working set written in %s", time.Since(start).Round(time.Millisecond))
 
-	t.Log("round\tunsynced_MiB\tresident_MiB\tsegs\tpinned_segs\tpinned_MiB\tworst_segs\tworst_MiB\tratio\tbarrier_ok")
+	probeRounds(t, fx, ctx, "bulk", rounds)
+
+	// Phase 2 is the shape the cold barrier actually meets and the one #2822 is
+	// about: a drained store plus a small uncarved tail. dfsbench writes its
+	// working set, drains it, and then the barrier re-drains before each read
+	// cell — so what it is looping against is a residue of leftovers, not the
+	// whole working set. A few KiB appended to each file is the same thing
+	// #2790's probe produced with 9 uncarved bytes.
+	t.Log("--- phase 2: small uncarved tail on a drained store ---")
+	for i := 0; i < files; i++ {
+		name := fmt.Sprintf("probe-%03d.bin", i)
+		pid := metadata.PayloadID(metadata.BuildPayloadID(fx.shareName, "/"+name))
+		tail := distinctBytes(4096, uint64(i)*0xC2B2AE35)
+		if err := common.WriteToBlockStore(ctx, fx.bs, pid, tail, uint64(fileMiB*mib)); err != nil {
+			t.Fatalf("tail write %q: %v", name, err)
+		}
+		if err := common.CommitBlockStore(ctx, fx.bs, pid); err != nil {
+			t.Fatalf("tail commit %q: %v", name, err)
+		}
+	}
+	probeRounds(t, fx, ctx, "tail", rounds)
+}
+
+// probeRounds samples the residue against what it actually pins, drains, and
+// repeats until the residue reaches zero or the rounds run out.
+func probeRounds(t *testing.T, fx *byteVerifyFixture, ctx context.Context, phase string, rounds int) {
+	t.Helper()
+	t.Logf("phase\tround\tunsynced_MiB\tresident_MiB\tsegs\tpinned_segs\tpinned_MiB\tworst_segs\tworst_MiB\tratio\tbarrier_ok")
 	for round := 0; round < rounds; round++ {
 		st := fx.bs.GetStatsLite()
 
@@ -130,10 +158,15 @@ func TestDrainPinProbe(t *testing.T) {
 			st.LocalDiskUsed <= 64<<20 ||
 			worstBytes <= st.LocalDiskUsed/5
 
-		t.Logf("%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%v",
-			round, st.UnsyncedBytes>>20, st.LocalDiskUsed>>20, st.Segments,
+		t.Logf("%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%v",
+			phase, round, st.UnsyncedBytes>>20, st.LocalDiskUsed>>20, st.Segments,
 			st.PinnedSegments, st.PinnedBytes>>20, worstSegs, worstBytes>>20,
 			ratio, barrierOK)
+		// Below a MiB the >>20 columns all read zero, so spell the small
+		// residue out — it is the whole point of the tail phase.
+		if st.UnsyncedBytes > 0 && st.UnsyncedBytes < 1<<20 {
+			t.Logf("  residue=%dB pinned=%dB worst=%dB", st.UnsyncedBytes, st.PinnedBytes, worstBytes)
+		}
 
 		if st.UnsyncedBytes == 0 {
 			t.Logf("residue reached zero at round %d", round)

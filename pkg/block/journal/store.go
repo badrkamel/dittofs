@@ -151,13 +151,14 @@ func (c Config) withDefaults() Config {
 // Stats is a coarse snapshot of store state, cheap to compute.
 type Stats struct {
 	Segments int
-	// PinnedSegments counts the sealed segments the synced-gate refuses to
-	// evict: each holds at least one record not yet on the remote. PinnedBytes
-	// is their on-disk footprint — the local disk an unsynced residue actually
-	// holds down, as opposed to what a one-segment-per-straggler estimate
-	// budgets for. Only the synced-gate is counted here; a segment held by a
-	// live snapshot's pin or by a concurrent claim is a different reason and
-	// stays out, so the pair reads as a property of the residue alone.
+	// PinnedSegments counts the segments an unsynced record holds down — the
+	// sealed ones the evict synced-gate refuses, plus the actives sealableActive
+	// refuses, which eviction therefore never reaches either. PinnedBytes is
+	// their on-disk footprint: the local disk a residue actually costs, as
+	// opposed to what a one-segment-per-straggler estimate budgets for. Only the
+	// unsynced reason is counted; a segment held by a live snapshot's pin or by
+	// a concurrent claim is a different reason and stays out, so the pair reads
+	// as a property of the residue alone.
 	PinnedSegments int
 	PinnedBytes    int64
 	// DiskBytes is the physical footprint of the segment files: segment headers
@@ -837,6 +838,17 @@ func (s *Store) Stats() Stats {
 			st.Segments++
 			st.LiveBytes += sh.active.liveBytes.Load()
 			st.DeadBytes += sh.active.deadBytes.Load()
+			// An active holding an unsynced record pins its bytes just as a
+			// sealed one does, by a different route: sealableActive refuses it,
+			// so the force-seal fall-through cannot move it into the sealed set
+			// where eviction looks. Below the rotation threshold this is the
+			// only pinning there is — the sealed set is empty and every byte
+			// sits in an active — so counting sealed segments alone would
+			// report zero for the case that motivated the question.
+			if sh.active.records.Load() > 0 && sh.active.syncedRecords.Load() != sh.active.records.Load() {
+				st.PinnedSegments++
+				st.PinnedBytes += sh.active.tail.Load()
+			}
 		}
 		for _, seg := range sh.sealed {
 			st.Segments++
