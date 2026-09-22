@@ -151,6 +151,15 @@ func (c Config) withDefaults() Config {
 // Stats is a coarse snapshot of store state, cheap to compute.
 type Stats struct {
 	Segments int
+	// PinnedSegments counts the sealed segments the synced-gate refuses to
+	// evict: each holds at least one record not yet on the remote. PinnedBytes
+	// is their on-disk footprint — the local disk an unsynced residue actually
+	// holds down, as opposed to what a one-segment-per-straggler estimate
+	// budgets for. Only the synced-gate is counted here; a segment held by a
+	// live snapshot's pin or by a concurrent claim is a different reason and
+	// stays out, so the pair reads as a property of the residue alone.
+	PinnedSegments int
+	PinnedBytes    int64
 	// DiskBytes is the physical footprint of the segment files: segment headers
 	// plus record framing plus payload, seeded at recovery from the segments
 	// already on disk and maintained by every append and retire. It is the
@@ -833,6 +842,10 @@ func (s *Store) Stats() Stats {
 			st.Segments++
 			st.LiveBytes += seg.liveBytes.Load()
 			st.DeadBytes += seg.deadBytes.Load()
+			if seg.syncedRecords.Load() != seg.records.Load() {
+				st.PinnedSegments++
+				st.PinnedBytes += seg.tail.Load()
+			}
 		}
 		sh.mu.Unlock()
 	}
