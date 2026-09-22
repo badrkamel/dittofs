@@ -1905,33 +1905,18 @@ adapters:
       max_handles_per_session: 1000
 ```
 
-### SMB3 Environment Variable Overrides
+### Managing SMB3 Settings
 
-All SMB3 settings can be overridden with environment variables:
+SMB adapter settings are persisted in the control-plane database. Configure
+them after logging in with `dfsctl`; `DITTOFS_ADAPTERS_SMB_*` environment
+variables do not override these settings.
 
 ```bash
-# Encryption
-export DITTOFS_ADAPTERS_SMB_ENCRYPTION_ENCRYPTION_MODE=required
+# Inspect current settings
+dfsctl adapter settings smb show
 
-# Signing
-export DITTOFS_ADAPTERS_SMB_SIGNING_ENABLED=true
-export DITTOFS_ADAPTERS_SMB_SIGNING_REQUIRED=true
-
-# Dialect
-export DITTOFS_ADAPTERS_SMB_MIN_DIALECT=3.0
-
-# Leases
-export DITTOFS_ADAPTERS_SMB_LEASES_ENABLED=true
-export DITTOFS_ADAPTERS_SMB_LEASES_DIRECTORY_LEASES=true
-export DITTOFS_ADAPTERS_SMB_LEASES_LEASE_BREAK_TIMEOUT=35s
-
-# Durable Handles
-export DITTOFS_ADAPTERS_SMB_DURABLE_HANDLES_ENABLED=true
-export DITTOFS_ADAPTERS_SMB_DURABLE_HANDLES_DEFAULT_TIMEOUT=60s
-
-# Cross-Protocol
-export DITTOFS_ADAPTERS_SMB_CROSS_PROTOCOL_DELEGATION_RECALL_TIMEOUT=90s
-export DITTOFS_ADAPTERS_SMB_CROSS_PROTOCOL_ANTI_STORM_TTL=30s
+# List supported update flags
+dfsctl adapter settings smb update --help
 ```
 
 #### Network discovery (mDNS / WS-Discovery)
@@ -2596,7 +2581,7 @@ export DITTOFS_LOGGING_LEVEL=DEBUG
 export DITTOFS_LOGGING_FORMAT=json
 
 # Server
-export DITTOFS_SERVER_SHUTDOWN_TIMEOUT=60s
+export DITTOFS_SHUTDOWN_TIMEOUT=60s
 
 # Database (Control Plane)
 export DITTOFS_DATABASE_TYPE=sqlite
@@ -2616,51 +2601,23 @@ export DITTOFS_CONTROLPLANE_SECRET=your-secret-key-at-least-32-characters
 export DITTOFS_CONTROLPLANE_PPROF=false
 export DITTOFS_CONTROLPLANE_PPROF_MUTEX_RATE=100
 export DITTOFS_CONTROLPLANE_PPROF_BLOCK_RATE_NS=1000000
-# Server-level configuration
-export DITTOFS_SERVER_SHUTDOWN_TIMEOUT=60s
-
-# Global rate limiting
-export DITTOFS_SERVER_RATE_LIMITING_ENABLED=true
-export DITTOFS_SERVER_RATE_LIMITING_REQUESTS_PER_SECOND=10000
-export DITTOFS_SERVER_RATE_LIMITING_BURST=20000
-
-# Metadata
-export DITTOFS_METADATA_TYPE=badger
-
-# NFS adapter
-export DITTOFS_ADAPTERS_NFS_ENABLED=true
-export DITTOFS_ADAPTERS_NFS_PORT=12049
-export DITTOFS_ADAPTERS_NFS_MAX_CONNECTIONS=1000
-
-# NFSv3 locking (NLM/NSM) — opt-in; see docs/NFS.md
-export DITTOFS_ADAPTERS_NFS_UDP_ENABLED=false        # serve NLM/NSM/MOUNT over UDP
-export DITTOFS_ADAPTERS_NFS_PORTMAPPER_ENABLED=false # enable embedded portmapper
-export DITTOFS_ADAPTERS_NFS_PORTMAPPER_PORT=10111    # set to 111 for macOS locking
-
-# NFS timeouts
-export DITTOFS_ADAPTERS_NFS_TIMEOUTS_READ=5m
-export DITTOFS_ADAPTERS_NFS_TIMEOUTS_WRITE=30s
-export DITTOFS_ADAPTERS_NFS_TIMEOUTS_IDLE=5m
-export DITTOFS_ADAPTERS_NFS_TIMEOUTS_SHUTDOWN=30s
-
-# SMB adapter
-export DITTOFS_ADAPTERS_SMB_ENABLED=true
-export DITTOFS_ADAPTERS_SMB_PORT=12445
-export DITTOFS_ADAPTERS_SMB_MAX_CONNECTIONS=1000
-
-# SMB credits
-export DITTOFS_ADAPTERS_SMB_CREDITS_STRATEGY=adaptive
-export DITTOFS_ADAPTERS_SMB_CREDITS_MIN_GRANT=16
-export DITTOFS_ADAPTERS_SMB_CREDITS_MAX_GRANT=8192
-export DITTOFS_ADAPTERS_SMB_CREDITS_INITIAL_GRANT=256
 
 # Start server with overrides
 DITTOFS_LOGGING_LEVEL=DEBUG ./dfs start
 ```
 
+Stores and protocol adapters are managed through the control-plane API and
+`dfsctl`, not through `DITTOFS_METADATA_TYPE` or `DITTOFS_ADAPTERS_*` variables.
+After logging in, use `dfsctl store metadata add` to create a metadata store,
+`dfsctl adapter edit nfs --port 12049` to set the NFS port, and
+`dfsctl adapter settings nfs show` or `dfsctl adapter settings smb show` to
+inspect protocol settings. See the [CLI reference](cli.md) for supported
+settings and update flags.
+
 ## Configuration Precedence
 
-Settings are applied in the following order (highest to lowest priority):
+Server settings are applied in the following order (highest to lowest priority).
+This precedence does not apply to stores or adapters managed through `dfsctl`:
 
 1. **Environment Variables** (`DITTOFS_*`) - Highest priority
 2. **Configuration File** (YAML/TOML)
@@ -2669,9 +2626,9 @@ Settings are applied in the following order (highest to lowest priority):
 Example:
 
 ```bash
-# config.yaml has port: 12049 (the DittoFS default)
-# Override it to the standard NFS port 2049 (binding <1024 requires root)
-DITTOFS_ADAPTERS_NFS_PORT=2049 ./dfs start
+# config.yaml has shutdown_timeout: 30s
+# Override the server shutdown timeout for this process
+DITTOFS_SHUTDOWN_TIMEOUT=60s ./dfs start
 ```
 
 ## Configuration Examples
