@@ -332,7 +332,8 @@ func TestOrphanSweepSparesYoung(t *testing.T) {
 // panicking or removing it, even past the orphan age gate. Quarantining the
 // damaged segment allows the intact data to be recovered unchanged.
 func TestSealedSegmentWithNoValidRecords(t *testing.T) {
-	dir := t.TempDir()
+	// Exercise a path whose separators or name need escaping when quoted.
+	dir := filepath.Join(t.TempDir(), "journal\\data")
 	s, err := openJournal(dir, Config{ShardCount: 1})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -367,7 +368,7 @@ func TestSealedSegmentWithNoValidRecords(t *testing.T) {
 		_ = r.Close()
 		t.Fatal("recovery accepted a sealed segment with no valid records")
 	}
-	if !strings.Contains(err.Error(), s.segPath(badID)) {
+	if !strings.Contains(err.Error(), fmt.Sprintf("%q", s.segPath(badID))) {
 		t.Fatalf("error must identify the damaged segment: %v", err)
 	}
 	got, err := os.ReadFile(s.segPath(badID))
