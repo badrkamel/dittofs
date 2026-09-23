@@ -170,11 +170,13 @@ func (h *Handler) handleClone(ctx *types.CompoundContext, reader io.Reader) *typ
 	// partial/offset sub-range clones fall in that bucket here (the dominant
 	// `cp --reflink` path is always whole-file). Validate offsets/count fit
 	// before deciding so a malformed sub-request still gets NFS4ERR_INVAL.
+	// Replacing a longer destination would also be a partial-range operation:
+	// its existing tail lies outside this request and must not be truncated.
 	if srcOffset > srcFile.Size || (count != 0 && srcOffset+count > srcFile.Size) {
 		return cloneErr(types.NFS4ERR_INVAL)
 	}
 	wholeFile := srcOffset == 0 && dstOffset == 0 && (count == 0 || count == srcFile.Size)
-	if !wholeFile {
+	if !wholeFile || dstFile.Size > srcFile.Size {
 		logger.Debug("NFSv4.2 CLONE sub-range not supported",
 			"srcOffset", srcOffset, "dstOffset", dstOffset, "count", count, "client", ctx.ClientAddr)
 		return cloneErr(types.NFS4ERR_NOTSUPP)
@@ -191,13 +193,13 @@ func (h *Handler) handleClone(ctx *types.CompoundContext, reader io.Reader) *typ
 		return cloneErr(types.NFS4ERR_SERVERFAULT)
 	}
 
-	// CloneWholeFile drains the source's pending rollups and re-reads its CAS
-	// manifest before copying, so a freshly-written (not-yet-rolled-up) source
-	// clones its real content instead of zeros.
-	if err := common.CloneWholeFile(
+	// Recheck the range after draining the source, alongside the manifest
+	// replacement. A destination that grew since the checks above must keep
+	// its tail rather than being silently truncated to the source's size.
+	if err := common.CloneWholeFileRange(
 		ctx.Context, blockStore, store, nil,
 		srcHandle, dstHandle,
-		dstFile.PayloadID,
+		dstFile.PayloadID, count,
 	); err != nil {
 		logger.Debug("NFSv4.2 CLONE failed", "error", err, "client", ctx.ClientAddr)
 		return cloneErr(types.StatusForErr(err))

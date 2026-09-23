@@ -56,7 +56,7 @@ func CopyPayload(
 		if err := blockStore.DrainRollups(ctx); err != nil {
 			return fmt.Errorf("CopyPayload: drain source rollups: %w", err)
 		}
-		return materializeLocalClone(ctx, blockStore, metadataStore, cache, srcFileHandle, dstFileHandle, dstPayloadID)
+		return materializeLocalClone(ctx, blockStore, metadataStore, cache, srcFileHandle, dstFileHandle, dstPayloadID, nil)
 	}
 
 	srcFile, err := metadataStore.GetFile(ctx, srcFileHandle)

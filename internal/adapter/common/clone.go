@@ -12,9 +12,8 @@ import (
 	"github.com/marmos91/dittofs/pkg/metadata"
 )
 
-// CloneWholeFile performs a whole-file NFSv4.2 CLONE / SMB duplicate-extents
-// reflink: the destination inherits the source's entire content by referencing
-// the same content-addressed blocks. It is O(1) — engine.CopyPayload bumps the
+// CloneWholeFile replaces the destination's entire content and size with the
+// source's, referencing the same content-addressed blocks. It is O(1) — engine.CopyPayload bumps the
 // CAS RefCount once per unique source hash, no data is read or written, even on
 // S3. This is the canonical `cp --reflink` case and the single cross-protocol
 // clone primitive (SMB FSCTL_DUPLICATE_EXTENTS_TO_FILE can adopt it without a
@@ -56,6 +55,44 @@ func CloneWholeFile(
 	srcHandle, dstHandle metadata.FileHandle,
 	dstPayloadID metadata.PayloadID,
 ) error {
+	return cloneWholeFile(ctx, blockStore, metadataStore, cache, srcHandle, dstHandle, dstPayloadID, nil)
+}
+
+// CloneWholeFileRange clones the source into the destination's prefix without
+// shrinking the destination. A zero count means the source's current size;
+// otherwise count must still cover exactly the source after the drain.
+// Destinations with a trailing range are rejected before their content changes.
+func CloneWholeFileRange(
+	ctx context.Context,
+	blockStore *engine.Store,
+	metadataStore metadata.Store,
+	cache CacheInvalidator,
+	srcHandle, dstHandle metadata.FileHandle,
+	dstPayloadID metadata.PayloadID,
+	count uint64,
+) error {
+	return cloneWholeFile(ctx, blockStore, metadataStore, cache, srcHandle, dstHandle, dstPayloadID, &count)
+}
+
+func validateWholeCloneRange(srcSize, dstSize, count uint64) error {
+	if count > srcSize {
+		return &metadata.StoreError{Code: metadata.ErrInvalidArgument, Message: "clone range exceeds the source size"}
+	}
+	if (count != 0 && count != srcSize) || dstSize > srcSize {
+		return &metadata.StoreError{Code: metadata.ErrNotSupported, Message: "clone would require a partial manifest replacement"}
+	}
+	return nil
+}
+
+func cloneWholeFile(
+	ctx context.Context,
+	blockStore *engine.Store,
+	metadataStore metadata.Store,
+	cache CacheInvalidator,
+	srcHandle, dstHandle metadata.FileHandle,
+	dstPayloadID metadata.PayloadID,
+	count *uint64,
+) error {
 	// Force the source's pending writes into CAS + the FileChunk manifest before
 	// we copy it. DrainRollups bypasses the stabilization window and persists
 	// FileAttr.Blocks, so the post-drain GetFile below observes the complete
@@ -72,7 +109,7 @@ func CloneWholeFile(
 	// real bytes into the destination's own journal instead. Remote shares keep
 	// the O(1) reflink below (their shared blocks are cold-hydratable).
 	if !blockStore.HasRemoteStore() {
-		return materializeLocalClone(ctx, blockStore, metadataStore, cache, srcHandle, dstHandle, dstPayloadID)
+		return materializeLocalClone(ctx, blockStore, metadataStore, cache, srcHandle, dstHandle, dstPayloadID, count)
 	}
 
 	selfClone := false
@@ -111,6 +148,14 @@ func CloneWholeFile(
 		dstFile, err := tx.GetFile(ctx, dstHandle)
 		if err != nil {
 			return fmt.Errorf("fetch dst file: %w", err)
+		}
+		// The caller's pre-drain sizes can be stale. Keep this check in the
+		// transaction that replaces the manifest so a destination grown before
+		// this snapshot cannot lose its tail, including on transaction retries.
+		if count != nil {
+			if err := validateWholeCloneRange(srcFile.Size, dstFile.Size, *count); err != nil {
+				return err
+			}
 		}
 
 		newBlocks, err := blockStore.CopyPayload(txCtx, string(srcFile.PayloadID), string(dstPayloadID), srcFile.Blocks)
@@ -247,6 +292,7 @@ func materializeLocalClone(
 	cache CacheInvalidator,
 	srcHandle, dstHandle metadata.FileHandle,
 	dstPayloadID metadata.PayloadID,
+	count *uint64,
 ) error {
 	// Re-read the source AFTER the caller's DrainRollups so Size and the source
 	// journal intervals reflect the fully-materialized post-rollup view.
@@ -259,6 +305,15 @@ func materializeLocalClone(
 	// destination content is unchanged, so skip the copy and the cache drop.
 	if srcFile.PayloadID == dstPayloadID {
 		return nil
+	}
+	if count != nil {
+		dstFile, err := metadataStore.GetFile(ctx, dstHandle)
+		if err != nil {
+			return fmt.Errorf("materialize clone: fetch dst file: %w", err)
+		}
+		if err := validateWholeCloneRange(srcFile.Size, dstFile.Size, *count); err != nil {
+			return err
+		}
 	}
 
 	// Copy the source bytes into the destination payload's own journal, chunked
@@ -301,7 +356,8 @@ func materializeLocalClone(
 		return fmt.Errorf("materialize clone: drain dst rollups: %w", err)
 	}
 
-	// The copy wrote only [0, srcSize). Whatever the destination held past that
+	// An unrestricted whole-file copy wrote only [0, srcSize). Whatever the
+	// destination held past that
 	// is still there: the write path supersedes by version, it does not clip, so
 	// a destination that was longer than the source keeps its tail. The size
 	// stamped below hides it from every read that clamps — until something grows
@@ -327,7 +383,10 @@ func materializeLocalClone(
 	if err != nil {
 		return fmt.Errorf("materialize clone: fetch dst file: %w", err)
 	}
-	if srcFile.Size < dstPre.Size {
+	// A range clone never clips a tail added while the copy was in flight.
+	// Its writes touch only the requested prefix, so preserving that tail also
+	// keeps local intervals and the manifest consistent with the final size.
+	if count == nil && srcFile.Size < dstPre.Size {
 		if _, err := blockStore.Truncate(ctx, string(dstPayloadID), dstPre.Blocks, srcFile.Size); err != nil {
 			return fmt.Errorf("materialize clone: clip dst past the source's size: %w", err)
 		}
@@ -342,7 +401,11 @@ func materializeLocalClone(
 		if err != nil {
 			return fmt.Errorf("fetch dst file: %w", err)
 		}
-		dstFile.Size = srcFile.Size
+		if count != nil {
+			dstFile.Size = max(dstFile.Size, srcFile.Size)
+		} else {
+			dstFile.Size = srcFile.Size
+		}
 		dstFile.Mtime = time.Now()
 		dstFile.Ctime = dstFile.Mtime // content change is also a metadata change
 		if err := tx.UpdateAttrs(ctx, dstFile); err != nil {
