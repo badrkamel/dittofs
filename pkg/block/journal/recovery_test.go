@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,15 +11,6 @@ import (
 	"testing"
 	"time"
 )
-
-// captureWarnings returns a *slog.Logger writing into a buffer and an accessor
-// for what was logged.
-func captureWarnings(t *testing.T) (*slog.Logger, func() string) {
-	t.Helper()
-	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	return log, buf.String
-}
 
 // reopen closes s and opens a fresh Store over the same directory, exercising
 // the recovery path. cfg only overrides s's Logger and Clock; every other
