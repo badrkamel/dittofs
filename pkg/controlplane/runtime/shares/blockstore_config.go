@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"path/filepath"
@@ -12,11 +13,12 @@ import (
 
 	"github.com/marmos91/dittofs/internal/logger"
 	"github.com/marmos91/dittofs/pkg/block"
-	"github.com/marmos91/dittofs/pkg/block/compression"
-	"github.com/marmos91/dittofs/pkg/block/encryption"
-	"github.com/marmos91/dittofs/pkg/block/encryption/keyprovider"
 	"github.com/marmos91/dittofs/pkg/block/engine"
 	"github.com/marmos91/dittofs/pkg/block/journal"
+	"github.com/marmos91/dittofs/pkg/block/middleware"
+	"github.com/marmos91/dittofs/pkg/block/middleware/compression"
+	"github.com/marmos91/dittofs/pkg/block/middleware/encryption"
+	"github.com/marmos91/dittofs/pkg/block/middleware/encryption/keyprovider"
 	"github.com/marmos91/dittofs/pkg/block/remote"
 	remotememory "github.com/marmos91/dittofs/pkg/block/remote/memory"
 	remotes3 "github.com/marmos91/dittofs/pkg/block/remote/s3"
@@ -138,16 +140,16 @@ func (n *nonClosingRemote) Close() error { return nil }
 // remote.RemoteStore (which has no Durable method) would silently drop the
 // capability, and engine.Store.RemoteDurable() would type-assert to
 // block.DurabilityReporter, fail, and report NOT durable for every production
-// S3-remote share — breaking the honest COMMIT/CLOSE contract (#1274) with a
-// spurious ErrNotDurableYet on every commit.
+// S3-remote share — breaking the contract that COMMIT and CLOSE answer
+// truthfully, with a spurious ErrNotDurableYet on every commit.
 func (n *nonClosingRemote) Durable() bool { return block.IsDurable(n.RemoteStore) }
 
 // decision: ReadChunk keeps its type assertion although RemoteStore embeds
-// ChunkReader, so like the block-keyed forwards just deleted it can never
-// fail. It stays because the fallback is a real error the caller handles
-// (ErrChunkReadUnsupported), not a silent capability drop, and deleting the
-// method would change which type serves the call. Drop it when ChunkReader
-// stops being optional anywhere.
+// ChunkReader, so a non-nil wrapped store always satisfies it. The one case the
+// fallback still covers is a nonClosingRemote built with a nil RemoteStore:
+// the assertion then fails and the caller gets ErrChunkReadUnsupported instead
+// of a nil-pointer panic deep in the read path. That is the whole of its value
+// — drop the assertion once construction cannot produce a nil wrapped store.
 //
 // ReadChunk delegates the remote.ChunkReader capability to the wrapped
 // store. The syncer's read path type-asserts ChunkReader on ITS remote — this
@@ -680,26 +682,28 @@ func (s *Service) acquireRemoteStore(ctx context.Context, ref string, provider B
 		return nil, "", fmt.Errorf("failed to create remote store: %w", err)
 	}
 
-	// Decorator order matters: encryption sits BELOW compression on the
-	// data flow (caller → compression → encryption → inner). Compress
-	// plaintext first so the compressor sees redundancy; encrypted bytes
-	// are incompressible by design.
-	//
-	// Apply order in code is therefore encryption first (innermost),
-	// then compression (outermost).
-	encWrapped, err := maybeWrapEncryption(ctx, newStore, remoteCfg)
+	// The pipeline runs its stages in the order remoteStages returns them,
+	// so that slice IS the seal order: compress, then encrypt.
+	stages, err := remoteStages(ctx, remoteCfg)
 	if err != nil {
 		_ = newStore.Close()
-		return nil, "", fmt.Errorf("failed to apply encryption policy: %w", err)
+		return nil, "", fmt.Errorf("failed to apply block store policy: %w", err)
 	}
-	newStore = encWrapped
-
-	wrapped, err := maybeWrapCompression(newStore, remoteCfg)
-	if err != nil {
-		_ = newStore.Close()
-		return nil, "", fmt.Errorf("failed to apply compression policy: %w", err)
+	if len(stages) > 0 {
+		wrapped, err := middleware.New(newStore, stages...)
+		if err != nil {
+			// No pipeline exists to close the stages, so release them here:
+			// the encryption stage holds the key provider.
+			for _, stage := range stages {
+				if c, ok := stage.(io.Closer); ok {
+					_ = c.Close()
+				}
+			}
+			_ = newStore.Close()
+			return nil, "", fmt.Errorf("failed to build the block store pipeline: %w", err)
+		}
+		newStore = wrapped
 	}
-	newStore = wrapped
 
 	// Double-check: another goroutine may have created the store concurrently.
 	s.mu.Lock()
@@ -726,64 +730,65 @@ func (s *Service) acquireRemoteStore(ctx context.Context, ref string, provider B
 	return newStore, configID, nil
 }
 
-// maybeWrapEncryption inspects the remote config's "encryption" key and,
-// when present, wraps inner with an encryption.EncryptedRemote. Returns
-// inner unchanged when the key is absent.
+// remoteStages builds the middleware stack for a remote config, in SEAL order.
 //
-// Key-provider lifetime is bound to the decorator: NewRemote captures
-// the provider, and EncryptedRemote.Close calls provider.Close. The
-// outer releaseRemoteStore path therefore closes the provider as part
-// of the normal decorator teardown.
-func maybeWrapEncryption(ctx context.Context, inner remote.RemoteStore, cfg *models.BlockStoreConfig) (remote.RemoteStore, error) {
+// decision: this function's statement order is the only thing that enforces
+// compress-before-encrypt. The stages accept each other in either arrangement,
+// and a swap produces a working store that compresses ciphertext at a ratio of
+// ~1.0 forever, silently — no error, no log line, just a ratio that never
+// improves. It stays an ordering convention rather than a type because this is
+// the sole construction site; give the order its own type the moment a second
+// site builds a stack. TestRemoteStages_CompressionBeforeEncryption is the only
+// test a reordering here fails: it calls this function and asserts the stage
+// types in the order returned. TestPipeline_CompressBeforeEncrypt shows the two
+// arrangements differ by sealed size, but it builds its own stages and never
+// reaches this code, so it stays green through a swap here.
+func remoteStages(ctx context.Context, cfg *models.BlockStoreConfig) ([]middleware.Transform, error) {
 	parsed, err := cfg.GetConfig()
 	if err != nil {
 		return nil, fmt.Errorf("parse block store config: %w", err)
 	}
-	raw, ok := parsed["encryption"]
-	if !ok {
-		return inner, nil
-	}
-	encoded, err := json.Marshal(raw)
-	if err != nil {
-		return nil, fmt.Errorf("marshal encryption sub-config: %w", err)
-	}
-	policy, err := encryption.ParsePolicy(encoded)
-	if err != nil {
-		return nil, err
-	}
-	provider, err := keyprovider.NewProvider(ctx, policy.Key)
-	if err != nil {
-		return nil, fmt.Errorf("create key provider: %w", err)
-	}
-	wrapped, err := encryption.NewRemote(inner, policy, provider)
-	if err != nil {
-		_ = provider.Close()
-		return nil, err
-	}
-	return wrapped, nil
-}
 
-// maybeWrapCompression inspects the remote config's "compression" key
-// and, when present, wraps inner with a compression.Decorator. Returns
-// inner unchanged when the key is absent.
-func maybeWrapCompression(inner remote.RemoteStore, cfg *models.BlockStoreConfig) (remote.RemoteStore, error) {
-	parsed, err := cfg.GetConfig()
-	if err != nil {
-		return nil, fmt.Errorf("parse block store config: %w", err)
+	var stages []middleware.Transform
+
+	if raw, ok := parsed["compression"]; ok {
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			return nil, fmt.Errorf("marshal compression sub-config: %w", err)
+		}
+		policy, err := compression.ParsePolicy(encoded)
+		if err != nil {
+			return nil, err
+		}
+		stage, err := compression.NewTransform(policy)
+		if err != nil {
+			return nil, err
+		}
+		stages = append(stages, stage)
 	}
-	raw, ok := parsed["compression"]
-	if !ok {
-		return inner, nil
+
+	if raw, ok := parsed["encryption"]; ok {
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			return nil, fmt.Errorf("marshal encryption sub-config: %w", err)
+		}
+		policy, err := encryption.ParsePolicy(encoded)
+		if err != nil {
+			return nil, err
+		}
+		provider, err := keyprovider.NewProvider(ctx, policy.Key)
+		if err != nil {
+			return nil, fmt.Errorf("create key provider: %w", err)
+		}
+		stage, err := encryption.NewTransform(policy, provider)
+		if err != nil {
+			_ = provider.Close()
+			return nil, err
+		}
+		stages = append(stages, stage)
 	}
-	encoded, err := json.Marshal(raw)
-	if err != nil {
-		return nil, fmt.Errorf("marshal compression sub-config: %w", err)
-	}
-	policy, err := compression.ParsePolicy(encoded)
-	if err != nil {
-		return nil, err
-	}
-	return compression.NewRemote(inner, policy)
+
+	return stages, nil
 }
 
 // releaseRemoteStore decrements the reference count and closes the remote store if no longer used.

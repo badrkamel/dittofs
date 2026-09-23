@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	vipermapstructure "github.com/go-viper/mapstructure/v2"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/marmos91/dittofs/internal/bytesize"
 	"github.com/marmos91/dittofs/internal/logger"
 	"github.com/marmos91/dittofs/pkg/adapter/nfs/identity"
@@ -19,7 +19,6 @@ import (
 	"github.com/marmos91/dittofs/pkg/controlplane/api"
 	"github.com/marmos91/dittofs/pkg/controlplane/store"
 	"github.com/marmos91/dittofs/pkg/identity/ldap"
-	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 )
@@ -76,7 +75,7 @@ type Config struct {
 	// (e.g. the BadgerDB block/index cache sizes). See MetadataConfig.
 	Metadata MetadataConfig `mapstructure:"metadata" yaml:"metadata"`
 
-	// GC configures the engine.CollectGarbage mark-sweep run.
+	// GC configures the gc.CollectGarbage mark-sweep run.
 	// These knobs apply globally to every block-store GC invocation.
 	GC GCConfig `mapstructure:"gc" yaml:"gc"`
 
@@ -134,7 +133,7 @@ func (c *IdentityConfig) Validate() error {
 	return nil
 }
 
-// GCConfig configures the engine.CollectGarbage mark-sweep run. Knobs
+// GCConfig configures the gc.CollectGarbage mark-sweep run. Knobs
 // cover the grace TTL, the dry-run sample bound, and the background
 // auto-GC schedule. GC is also runnable on demand (dfsctl/REST).
 type GCConfig struct {
@@ -194,7 +193,7 @@ func (c *GCConfig) AutoGCEnabled() bool {
 // Validate returns an error if the GCConfig has invalid values.
 //
 // GracePeriod: zero is allowed (the engine substitutes the 1h default in
-// ApplyDefaults / engine.Options). Any positive value below 5m is
+// ApplyDefaults / gc.Options). Any positive value below 5m is
 // rejected: server-S3 clock skew under sustained load can easily exceed
 // a few minutes, and a sub-5m grace TTL collapses the snapshot-grace
 // contract that protects in-flight CAS PUTs from being reaped on the
@@ -821,11 +820,11 @@ func Load(configPath string) (*Config, error) {
 	// from removed config trees (e.g. the deleted `lock:`/`syncer:` sections or
 	// a `cache:` block) without hard-failing boot on an otherwise-valid config
 	// that still carries a legacy key (upgrade safety).
-	var md vipermapstructure.Metadata
+	var md mapstructure.Metadata
 	var cfg Config
 	if err := v.Unmarshal(&cfg,
 		viper.DecodeHook(configDecodeHooks()),
-		func(dc *vipermapstructure.DecoderConfig) { dc.Metadata = &md },
+		func(dc *mapstructure.DecoderConfig) { dc.Metadata = &md },
 	); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}

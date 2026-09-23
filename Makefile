@@ -1,4 +1,4 @@
-.PHONY: setup-hooks check-hooks fmt lint vet build bench-phase12 build-bench bench-blockstore bench-all test-unit test-e2e test-posix test-smb-conformance test-all
+.PHONY: vulncheck vulncheck-main vulncheck-operator setup-hooks check-hooks fmt lint vet build bench-phase12 build-bench bench-blockstore bench-all test-unit test-e2e test-posix test-smb-conformance test-all
 
 # Configure git to use the project's hooks directory and make hooks
 # executable. Safe to re-run.
@@ -42,10 +42,26 @@ lint:
 vet:
 	go vet ./...
 
+# Keep scans opt-in: findings depend on the active compiler and live vulnerability database.
+GOVULNCHECK_VERSION ?= v1.8.0
+
+# Check both modules, even when the first scan reports vulnerabilities or fails.
+vulncheck:
+	@status=0; \
+	$(MAKE) vulncheck-main || status=1; \
+	$(MAKE) vulncheck-operator || status=1; \
+	exit $$status
+
+vulncheck-main:
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+
+vulncheck-operator:
+	cd k8s/dittofs-operator && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+
 # Build both CLI binaries
 build:
-	go build -o dfs cmd/dfs/main.go
-	go build -o dfsctl cmd/dfsctl/main.go
+	go build -o dfs ./cmd/dfs
+	go build -o dfsctl ./cmd/dfsctl
 
 # Phase 12 perf gate (D-43): rand-read regression gate vs per-machine
 # microbench floor in test/e2e/BENCHMARKS.md. -benchtime=10s gives a
@@ -61,10 +77,10 @@ bench-phase12:
 build-bench:
 	go build -o dfsbench ./cmd/bench
 
-# Run the blockstore engine write-path Go benchmarks (10 iterations for benchstat).
+# Run the blockstore engine write-path Go benchmarks (10 samples of 10 iterations).
 bench-blockstore:
 	go test -bench 'SequentialWrite8MB|RandomWrite4KB|DedupHeavy|MixedRW|FlushChurn' \
-		-benchtime=10x -run=^$$ ./pkg/block/engine/
+		-benchtime=10x -count=10 -run=^$$ ./pkg/block/engine/
 
 # Umbrella target for the relocated component benches. Append more bench-<area>
 # targets (e.g. ./pkg/snapshot/) as they grow.

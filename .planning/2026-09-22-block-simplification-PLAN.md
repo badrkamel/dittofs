@@ -208,17 +208,20 @@ index two structures that must agree about residency at all times — the exact 
 
 | # | Collapse | Evidence |
 |---|---|---|
-| 1 | **`nonClosingRemote`'s ~90 lines of manual forwards** (`shares/blockstore_config.go:156-212`) | It **embeds** `remote.RemoteStore`, so Go already promotes all seven methods. Only `Durable()` is genuinely needed. |
-| 2 | **Delete `Reader`/`Writer`/`Flusher`/`ComposedStore`** (`filechunk.go:174-280`) | 4 interfaces, 16 methods, ~110 LOC. Combined references outside their own definitions: **one**, a `var _`. Move `Flusher.Flush`'s godoc to `engine.Store.Flush`. |
+| 1 | ~~**`nonClosingRemote`'s ~90 lines of manual forwards**~~ **DONE — Wave 1** (`shares/blockstore_config.go:156-212`) | It **embeds** `remote.RemoteStore`, so Go already promotes all seven methods. Only `Durable()` is genuinely needed. |
+| 2 | ~~**Delete `Reader`/`Writer`/`Flusher`/`ComposedStore`** (`filechunk.go:174-280`)~~ **DONE** | 4 interfaces, 16 methods, ~110 LOC. Combined references outside their own definitions: **four** — the `var _` (`engine/engine.go:19`), a doc cross-reference in `engine/sync_drain.go:21`, and two more in `FlushResult`'s own godoc (`filechunk.go:282,290`). `Flusher.Flush`'s godoc moved to `engine.Store.Flush`. |
 | 3 | **Three MetaViews → one**, + `blockSyncedMarkerGC` → `SyncedHashIndex` | `CompactMetaView ⊇ ReclaimMetaView ⊇ ReconcileMetaView` — a real superset chain, so one interface serves all three. **CORRECTION: their assertions are NOT tautological.** `ReconcileMetaView` needs `EnumerateSynced`, which `metadata.Store` does not declare (`SyncedHashStore` has only `IsSynced`/`MarkSynced`/`GetLocator`/`DeleteSynced`). They do real narrowing — keep every one. −3 interfaces, −0 assertions. |
 | 4 | **Four flush sinks → one** (`flush.go:54-107`) | Both production sinks implement all four; the file asserts it at `:168-176`. The optionality serves **test fakes only**. Removes the blind `c.sink.(ManifestRowEnder)` at `flush_closure.go:234` — a latent nil-panic. |
 | 5 | **Delete 4 dead capability seams** | `local.MetricsAware` (0 impls → two Prometheus metrics permanently zero); `legacyArchiveMigrator` (0 impls → `legacy_verify.go:135-170` unreachable); `syncingEnumerator` (0 production impls — badger is prod); `blockcodec.Sealer` (0 impls; all 3 call sites pass `nil`). |
 | 6 | **`walkLive(sh, fn)` helper** in `journal/reclaim.go` | **Six** copies of one shard-index walk (`:257, :469, :634, :764, :884, :950`) differing only in accumulator. Makes `dropVictim` a map lookup. Must **not** lock — 4 of 6 run inside a wider critical section. |
 | 7 | **Merge `carver.Chunk` into `engine.CarveChunk`** | Same struct, one renamed field, one extra key, an incidental `int64`/`int` split on `Size`. |
-| 8 | **Strip 24 always-true type assertions** (13 non-test) | All rooted in `remote.RemoteStore` embedding `RemoteBlockStore`/`ChunkReader`/`ChunkSealer` (`remote/remote.go:43-46`) — e.g. `encryption/decorator.go:61,108`, `compression/decorator.go:61,145`, `remote/passthrough.go:44`, `runtime/blockgc.go:482,553`. **None are MetaViews.** |
+| 8 | **Strip 24 always-true type assertions** (13 non-test) — **PARTLY DONE (Waves 1-2).** The four decorator sites are gone (Wave 2); `remote/passthrough.go` and the shares forwards went in Wave 1. `runtime/blockgc.go` and the engine sites remain. One in `blockstore_config.go` is deliberately KEPT with a `decision:` marker — its fallback is a real error a caller handles, and deleting the method would change which type serves the call | All rooted in `remote.RemoteStore` embedding `RemoteBlockStore`/`ChunkReader`/`ChunkSealer` (`remote/remote.go:43-46`) — e.g. `encryption/decorator.go:61,108`, `compression/decorator.go:61,145`, `remote/passthrough.go:44`, `runtime/blockgc.go:482,553`. **None are MetaViews.** |
 
-**Deliberately not collapsed:** `local.LocalStore`'s 35 methods (2 full implementors, a `ponytail:`
-marker owns the decision); `FileChunkStore` vs `EngineFileChunkStore` (strict superset, both have a
+**Deliberately not collapsed:** ~~`local.LocalStore`'s 35 methods (2 full implementors, a
+`ponytail:` marker owns the decision)~~ — **WRONG on both counts, see 4A′.** There is one
+implementor; the second is a test-only double with zero non-test importers. The package is to be
+deleted and the interface folded into `journal`, which Wave 1C already said and this line
+contradicted; `FileChunkStore` vs `EngineFileChunkStore` (strict superset, both have a
 real consumer in `pkg/metadata/store.go`); journal-GC vs engine-compaction ratio gates (2 lines of
 overlap, five axes of genuine difference); `ChunkRef` vs `Row` (transient projection vs persisted
 row — collapsing them would put `RefCount` and `LastAccess` in every file's attribute blob).
@@ -294,12 +297,17 @@ pkg/block/                       the vocabulary. A LEAF — imports nothing inte
 │       ├── gear.go       (20)
 │       └── params.go     (40)
 │
-├── middleware/                  NEW — the generic interface + its two implementations
-│   ├── README.md                the Layer contract; why Compose takes two NAMED slots
-│   ├── middleware.go     (110)  Layer, decorator, Compose(inner, compress, encrypt)
-│   ├── compression/             codec.go (95) · frame.go (110) · policy.go (90) · errors.go (20)
-│   └── encryption/              layer.go (150) · frame.go (180) · policy.go (100) · errors.go (30)
-│       └── keyprovider/         provider.go (60) · local.go (345) · kmip.go (335) — KEEP
+├── middleware/                  a parent for the two decorators. NO Go files, NO Layer,
+│   │                            NO Compose — both decorators already embed
+│   │                            remote.Passthrough and override only SealChunk/ReadChunk,
+│   │                            which are already remote.ChunkSealer/ChunkReader
+│   ├── README.md                why the two are ordered compress-then-encrypt (AEAD
+│   │                            output is incompressible). UNTESTED — see Wave 2
+│   ├── compression/             codec.go (210) · frame.go (75) · policy.go (83) ·
+│   │                            errors.go (15) · decorator.go (163)
+│   └── encryption/              decorator.go (201) · frame.go (177) · policy.go (100) ·
+│       │                        errors.go (26)
+│       └── keyprovider/         provider.go · local.go · kmip.go — KEEP
 │
 ├── journal/                     the rewrite. ONE durable index.
 │   ├── README.md                the model; the checkpoint contract; the demote ordering rule;
@@ -338,14 +346,21 @@ pkg/block/                       the vocabulary. A LEAF — imports nothing inte
 │   ├── README.md                every pass here runs offline, never on the hot path; the
 │   │                            live set MUST span every lifecycle state (#2265 reaped
 │   │                            actives by scanning only the sealed set)
-│   ├── gc.go (400) · gc_rootlock.go (120) · gc_errors.go (140) · gc_block.go (415)
-│   ├── sweep_index.go (380) · sweepguard.go (196) ← dedup_sweep_guard.go
-│   ├── gcstate.go (250)  badger-backed live-hash set (GC-specific)
-│   ├── lastrun.go (90)   NEW — ONE persist-last-run. Replaces TWO copies:
-│   │                     gcstate.go:302 → last-run.json, audit_state.go:256 → last-inv02.json
+│   ├── gc.go (733) · gc_block.go (179)   no gc_rootlock.go / gc_errors.go: the root
+│   │                     lock and the error classification live inside gc.go
+│   ├── sweep_index.go (156) · sweepguard.go (207) ← dedup_sweep_guard.go. Exports
+│   │                     exactly one symbol, AdoptDedup; stripes stay private
+│   ├── gcstate.go (295)  badger-backed live-hash set (GC-specific)
+│   ├── lastrun.go (85)   ONE persist-last-run, replacing TWO copies. Verified
+│   │                     identical first: same perms, tmp naming, rename ordering,
+│   │                     cleanup, empty-root no-op; neither fsyncs, and the helper
+│   │                     states why non-durable is right for a rerunnable report
 │   ├── orphan_reclaim.go (295) ← engine/reclaim.go (collided with journal/reclaim.go)
-│   ├── compaction.go (353) · check.go (330) · repair.go (500) · ranges.go (80)
-│   └── audit.go (200)    refcount audit, minus its own persist-last-run
+│   ├── reconcile.go (216) ← engine. NOT in the original tree; leaving it behind
+│   │                     would have CREATED the gc → engine edge, not avoided it
+│   ├── compaction.go (353) · check.go (448) · repair.go (467)
+│   │                     no ranges.go: findBlocksForRange was deleted in Wave 1
+│   └── audit.go (240)    refcount audit, minus its own persist-last-run
 │
 ├── remote/                      THE store. The only thing called a store.
 │   ├── README.md · remote.go (150) · meta.go (80) ← block/blockstore.go
@@ -442,35 +457,99 @@ Nothing above changes a wave's scope except #2829, which was already in it.
   Prometheus metrics have been permanently zero.
   **`EvictLocal` is already gone** — deleted by `8243e9a6b` (#2821) mid-session. Nothing to do.
 
-### Wave 2 — extraction + collapses (after Wave 0), 3 parallel tracks
-- **2A** `pkg/block/gc` ← the GC cluster. **The file list in the tree was wrong and must be
-  re-derived:** `gc_rootlock.go`, `gc_errors.go` and `ranges.go` **do not exist** (the root lock is
-  `gc.go:76-128`, error classification `gc.go:595-689`), and `range.go` holds only
-  `findBlocksForRange`, which Wave 1B **deletes** — the plan both moved and deleted it.
-  **This move creates a cycle in BOTH directions, and `*Store` coupling is not the blocker — there
-  are zero `func (bs *Store)` methods in the moving set:**
-  - `engine → gc`: `BlockSize` is declared in **`gc.go:52`** and used at 17 sites in
-    `fetch.go`/`syncer.go`/`warm.go`/`types.go`; `flush.go:149` calls `dedupGuard.adopt`;
-    `reconcile.go:137` calls `resolveGracePeriod`/`Options` from `gc.go`.
-  - `gc → engine`: `ReconcileMetaView`, `ReconcileClass`, `defaultReconcileSampleCap`
-    (`reconcile.go`), `coalesceExtents` (`dataextents.go:131`), `newBlockID` (`carve_dispatch.go:163`).
-  **Wave 0 must move `BlockSize` out of `gc.go` first.** `reconcile.go` and `carve_dispatch.go` must
-  be placed explicitly — they appear nowhere in the tree today. `dedupGuard` is a deliberately
-  package-private rendezvous between the write and sweep paths (`dedup_sweep_guard.go:92-94`);
-  moving it means **exporting** it. Also note 2A is a **public-API change across four more trees** —
-  `cmd/dfsctl`, `internal/controlplane/api/handlers`, `pkg/config`, `pkg/controlplane/runtime`
-  consume `engine.GCStats`, `engine.ManifestCheckResult` and friends. **Not `engine.BlockSize`** —
-  it had zero references outside the package and Wave 0 deleted it as a bare alias of
-  `block.BlockSize`. Fourth wrong file list in this plan; re-derive before trusting one.
-- **2B** Same package ← `manifest_check.go`, `manifest_repair.go`, `audit_state.go`. Move
-  `repairPayload` (`manifest_check.go:374`) into `repair.go`; collapse the two persist-last-run
-  implementations into `lastrun.go`. Collapses #3. *Land 2A first.*
-- **2C** `pkg/block/middleware/` per the tree. Collapses #1, #8.
+### Wave 2 — extraction + collapses — **LANDED**
+Shipped as 2A (with 2B folded in) and 2C. `pkg/block/gc` is 3,674 LOC; `pkg/block/engine`
+dropped 11,359 → 7,577. The edge is one-directional: `gc` imports nothing from `engine`, and
+`engine → gc` is a single call, `gc.AdoptDedup` at `flush.go:149`.
+
+**What this section got wrong, recorded so Wave 3 does not inherit it:**
+- **Both claimed `gc → engine` edges were backwards.** `Options` is declared at `gc.go:158` and
+  `ReconcileMetaView`/`ReconcileClass`/`defaultReconcileSampleCap` are declared in `reconcile.go`
+  — all inside the moving set. Moving `reconcile.go` into `gc` (which this section never placed)
+  dissolved them rather than creating them.
+- **`resolveGracePeriod` has no `reconcile.go:137` caller.** It is declared in `gc.go` and called
+  only from `gc_test.go`.
+- **The `BlockSize` edge was already dead.** Wave 0 deleted the bare alias, so the "Wave 0 must
+  move `BlockSize` out of `gc.go` first" prerequisite was met by deletion, not relocation.
+- **2B was not a separate track.** Its three files are exactly what 2A relocates, so running them
+  in parallel would have had two agents rewriting the same files. Folded into 2A.
+- **Collapses #1 and #8 were already spent in Wave 1**, not available to 2C.
+
+**Decisions taken that this section did not anticipate:**
+- `reconcile.go` → `gc`; `carve_dispatch.go` stays in `engine` (it is `*RemoteSync` dispatch).
+- `coalesceExtents`, `newBlockID` and `findRowCoveringOffset` were lifted to `pkg/block` rather
+  than exported across the boundary. `coalesceExtents`' tail was already duplicated in
+  `holemap.go:normalizedExtents`, so the lift deleted a real duplicate. `pkg/block` stays a leaf;
+  `TestNoForeignImports` still covers it.
+- `dedupGuard` moved to `gc`, exporting exactly one symbol (`AdoptDedup`). The stripes and the
+  sweep-side `claim`/`releaseClaim`/`pruneAdoptions` stay package-private, so the stripe mutex
+  never crosses the boundary. Cost, recorded at the code site: `gc_sweep_dedup_race_test.go` no
+  longer pins that `engineDeduper.IsChunkDurable` routes through `AdoptDedup`.
+- **2C shipped NO `Layer` and NO `Compose`, deliberately.** Both decorators already embed
+  `remote.Passthrough` and override only `SealChunk`/`ReadChunk`, which are already the interface
+  pair `remote.ChunkSealer`/`remote.ChunkReader` — a `Layer` would be a second abstraction over
+  the same seam, and the two transforms share a signature but no logic (compression ignores `ctx`
+  and `hash`; encryption needs both, and rejects unframed input where compression passes it
+  through). `Compose` has one construction site and could not carry the config parsing that is
+  the bulk of each wrap. The ordering rationale it would have documented — AEAD output is
+  incompressible, so compress-before-encrypt is not caller-configurable — is instead a
+  `decision:` marker at that single site plus `middleware/README.md`.
+  **Open gap: compress-before-encrypt has no test.** A swap yields a working store that
+  compresses ciphertext at ratio ~1.0 forever, silently.
+- `pkg/block/middleware/` holds no Go files — a README and two subpackages.
 
 ### Wave 3 — god-object splits (after 1 and 2)
-- **3A** `carver` absorbs the carve loop; `chunker` nests under it; add `BenchmarkCarver_Box`.
-- **3B** `engine/syncer.go` 1249 → six files; extract `readaheadTracker`, `inflightFetches`.
-- **3C** `journal/reclaim.go` 1037 → four files. Collapses #6.
+- **3A — WITHDRAWN. All three clauses verified false; nothing moved.**
+  - **The carve loop cannot move into `carver`.** It is `flushClosure.fn`'s
+    read/Box loop, `flush_closure.go:103-161` (the plan's `:102-147` stops mid-`if`,
+    and `:282-293` cuts a `journal.Extent` literal in half — the intended
+    `contiguousRanges` is `:290-303`). The loop reads through `journal.Run` and
+    `local.LocalStore`, and emits through `CarveChunk` (`flush.go:39`), `BlockSink`
+    (`:55`), `Deduper` (`:34`), `ManifestRowEnder` (`:81`), `ClobberGuard` (`:104`)
+    and `uploadChain` (`flush_closure.go:347`) — all six declared in `engine`,
+    which already imports `carver` (`flush.go:14`, `flush_closure.go:8`). This is
+    Wave 2's shape with the opposite answer: there the symbols were inside the
+    moving set and the move dissolved the edge; here they are outside it and on
+    the far side of an existing edge, so the move is an import cycle. Pinned by
+    `carver/foreign_imports_test.go`.
+  - **`chunker` must not nest under `carver`.** `carver` is not its only consumer:
+    `engine/types.go:89` (`Config.ChunkParams`, public config), `engine/sync_drain.go:152`,
+    `engine/flush_closure.go:112`, `controlplane/runtime/shares/journal_open.go:80`
+    and `internal/dfsbench/backend/dittofs.go:606`, plus ten test files — sixteen
+    files across three top-level trees. Nesting would make the control plane import
+    a carve-path-private package to size share params. `chunker` is shared
+    vocabulary, the same exception the tree grants `pkg/block` root.
+  - **`BenchmarkCarver_Box` already exists in shape, one layer out.**
+    `BenchmarkSequentialWrite8MB` (novel-heavy) and `BenchmarkDedupHeavy`
+    (dedup-heavy) in `engine/write_bench_test.go` drive `Store.Flush` through
+    `carver.Box` with `b.ReportAllocs()`, and `make bench-all` reaches them.
+    Nothing reaches `./pkg/block/carver` or `./pkg/block/chunker` — no workflow
+    passes `-bench` at all — so a carver-scoped copy would be the unrun kind Wave 1
+    deleted, and a *worse* measurement: it excludes the 16 MiB `buf` allocated per
+    run at `flush_closure.go:112`, which the engine benches include.
+  - **Neither file in scope is a god object**: `carver.go` 257, `flush_closure.go` 524,
+    both under the tree's own 800 ceiling. The tree's `carver.go (390)` + `batch.go (180)`
+    would inflate 257 lines into 570.
+- **3B — the split SHIPPED; the field extraction DECLINED, not done.** `engine/syncer.go`
+  → six files (`syncer.go` now 314, plus `sync_drain.go`, `sync_fileops.go`,
+  `sync_health.go`, `sync_lifecycle.go`, `upload_window.go`); `fetchResult` moved to
+  `fetch.go` beside its builders and the metrics accessor into `metrics.go`. Every
+  declaration moved byte-identical.
+  - **`readaheadTracker` and `inflightFetches` were NOT extracted.** They are names
+    this plan PROPOSES for types that do not exist yet (see the field-isolated
+    extraction seams table above), so a zero-hit grep for either name is what the
+    plan's own wording predicts, not evidence the work is unnecessary. The fields
+    are all still on `RemoteSync`: `inFlight`/`inFlightMu` (`syncer.go:56-57`, read
+    in `fetch.go`) and `readahead`/`readaheadN`/`readaheadPruning` (`:67-69`, read
+    in `readahead.go`). That seam is untouched and still open.
+- **3C — the split SHIPPED; #6 was NOT collapsed.** `journal/reclaim.go` → four files
+  (`evict.go` 393, `reclaim.go` 177, `gc.go` 184, `repack.go` 348), every declaration
+  moved byte-identical. The six duplicate shard-index walks moved with it and are
+  still six — `reclaim.go:136`, `evict.go:238`, `gc.go:115`, `repack.go:68`, `:195`,
+  `:261` — and no `walkLive` helper was written. A file split cannot collapse them:
+  row 6's own constraint (4 of the 6 run inside a wider critical section, so the
+  helper must not lock) is what the segment→intervals reverse index is for, and that
+  index is 4F's work.
 - **3D** `engine.Store` — **delete the 14 forwards, re-measure, then decide** whether to split.
 - **3E** Renames + the `pkg/block/manifest` extraction. **MUST BE LAST**, after 2A/2B have moved
   files — 3E touches `syncer.go`, `fetch.go`, `flush.go`, `engine.go`, `readwrite.go`, i.e. every
@@ -490,10 +569,59 @@ Nothing above changes a wave's scope except #2829, which was already in it.
 
 ### Wave 4 — the journal (after 1A and 3C). No segment format change.
 
-- **4A — the three live bugs, as standalone PRs, first.** Tombstones uncounted in `seg.records`
-  (resurrection — **#2829**); the `records > 0` guard on `evictable()`; `compactColdLog`'s
-  recovery-only gate. The latter two have no issue yet — file them or fix them, do not leave them
-  living only in this document. These stand on their own and should not wait for the restructuring.
+- **4A — the live bugs, as standalone PRs, first.**
+  - ~~Tombstones uncounted in `seg.records` (resurrection — #2829)~~ and ~~the `records > 0`
+    guard on `evictable()`~~ — **DONE**, PR #2854 / issue #2841. Both retire paths
+    (`evictSegment` and `reclaimEmptied`) now call `carryMarkersForward` before
+    `retireSegment` unlinks, keeping each marker's original Version. The counting itself was
+    left alone: markers stay uncounted, matching the append path and the recovery replay, so a
+    restart reconstructs the same counters. Note the fix needed BOTH callers of `evictable` —
+    the issue named only eviction, and `reclaimEmptied` runs at the end of every `Delete`.
+  - `compactColdLog`'s recovery-only gate — **still open, still has no issue.** File it or fix
+    it; do not leave it living only in this document.
+
+- **4A′ — fold `LocalStore` into `journal`, and delete `pkg/block/local` + `pkg/block/local/memory`.**
+  This was Wave 1C scope and dropped out of an earlier draft. It is a **prerequisite for 4E**,
+  and it resolves a contradiction this document carried: the Q3 table calls `local.LocalStore`
+  "deliberately not collapsed" with "2 full implementors", while Wave 1C says delete the package.
+  The delete is right, and the count is wrong.
+  - **One implementor.** `var _ LocalStore = (*journal.Store)(nil)` is the only assertion in the
+    tree. The second "implementor" is `pkg/block/local/memory`, which has **zero non-test
+    importers** — counting a test double as an implementor is the reasoning that keeps a useless
+    interface alive.
+  - **It breaks no cycle.** `journal` imports nothing internal — a true leaf, pinned by its own
+    `foreign_imports_test.go`. So `engine → local → journal` can simply be `engine → journal`;
+    the interface adds a hop rather than inverting a dependency.
+  - **35 methods is a mirror, not a narrowing.** "Accept interfaces" means narrow ones.
+  - **The real cost, stated honestly: 34 Go test files import the memory double** (`git grep -l
+    'pkg/block/local/memory"' -- '*_test.go'`; one of them is the package's own
+    `memory/durability_test.go`, which is deleted with it, so 33 are rewrites) and they would
+    construct a real journal on `t.TempDir()` instead — slower and disk-bound. That cost is why this keeps
+    being deferred, and it is the only argument for keeping the package. It is weakened by the
+    double being unfaithful: its `Flush` ignores `opts` entirely, so tests pass against behaviour
+    the real store does not have.
+
+- **4E — metrics, after 4A′ and 4B. Issue #2857.** Four registered Prometheus instruments
+  (`backpressureTotal`, `backpressureWaitSeconds`, `evictionsTotal`, `evictedBytesTotal`) have
+  read zero for the life of every process, and exported-and-always-zero is worse than absent.
+  - **`MetricsAware` is unimplementable where it is declared**, not merely unimplemented.
+    `MetricsRecorder` sits in `pkg/block/local`, and `pkg/block/local/local.go:16` imports
+    `pkg/block/journal`, so the only local tier production runs cannot name the type without an
+    import cycle. The seam's own doc names `*fs.FSStore` as its implementor; there is no `fs`
+    package. The engine's probe has therefore never once been true.
+  - **Moving the recorder to `pkg/block` does not work either** — tried and reverted. It breaks
+    the journal's pinned leaf rule: *journal may import only the standard library and
+    golang.org/x/sys*. The recorder must be declared **inside `journal`**, with the engine
+    probing `interface{ SetMetrics(journal.MetricsRecorder) }`.
+  - Sequenced here because 4A′ decides whether `local` still exists and 4B reshapes the call
+    sites. A working prototype exists (A/B verified: removing the recorder calls produced
+    `recorded 0 evictions, want 1`, the production symptom); it was reverted for sequencing, not
+    because it failed.
+  - When it lands: pointer cell, not a value — the runtime installs the handle after the store is
+    already serving. Record one eviction per reclaimed segment **on the disk-pressure path only**
+    (a repack also unlinks a segment but replaces rather than reclaims, and counting it makes the
+    eviction rate read high on a store under no pressure). Record backpressure **only when the
+    write path actually sleeps**, not when the capacity gate finds room.
 - **4B** Split `journal/store.go` 1557 → six files — **`shard.groupCommit` moves here; see #2817
   before or after, never during**; extract `coldLog` (`coldMu`/`coldFD`/
   `coldBroken`) and `reclaimer` (`gcMu`) on their field-isolated seams; delete the 4 test seams from
@@ -514,7 +642,13 @@ Nothing above changes a wave's scope except #2829, which was already in it.
 - **4F — unify reclaim.** #2822's baseline must exist before this starts. One entry point, two strategies (drop a fully-synced sealed segment;
   repack a high-dead-ratio one), behind the **segment→intervals reverse index** that
   `reclaim.go:305-307` already asks for — which also collapses the six duplicate index walks
-  (`:262, :474, :639, :769, :889, :955`) into one lock-held helper.
+  (six `range sh.index` walks) into one lock-held helper — **DECLINED by 3C, on evidence.**
+  Four sites bind a value copy and provably cannot write; one binds `&fi.ivs[k]` and writes
+  through it, so a `fn(id, *interval)` helper hands write access to the four that currently
+  cannot have it. `dropVictim` short-circuits mid-walk and unlocks from inside the loop, which no
+  callback shape serves. Five of six run with `sh.mu` already held and one takes it itself, so a
+  locking helper deadlocks five and a non-locking one still cannot serve the sixth. Net saving
+  after a 9-line helper: ~15 lines. Do not re-propose without addressing the pointer-binding site.
 - ~~Per-shard checkpoint~~, ~~interval coalescing~~, ~~fence-map collapse~~, ~~format bump~~,
   ~~shard-count retune~~ — **all dropped**, see the design section.
 
