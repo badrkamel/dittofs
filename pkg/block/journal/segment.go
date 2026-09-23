@@ -22,8 +22,8 @@ import (
 //	28   4     HeaderCRC32 covers bytes [0,28)
 //	32   32    Reserved
 //
-// The header is the source of truth on recovery: a set sealed bit means the
-// segment is immutable and trusted without a full tail re-scan.
+// The header is the source of truth on recovery: a set sealed bit means every
+// record was committed, so an incomplete scan is corruption, not a torn append.
 const (
 	segHeaderSize      = 64
 	segHeaderCRCCovers = 28
