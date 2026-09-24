@@ -219,8 +219,10 @@ func (r *recoveryState) loadSegment(id uint64) error {
 		// records after the damage. Refuse the open and preserve the file.
 		if len(recs) == 0 || validUpTo != info.Size() {
 			_ = fd.Close()
-			return fmt.Errorf("journal: sealed segment %q is corrupt at offset %d (size %d): %w",
-				path, validUpTo, info.Size(), errTornRecord)
+			return fmt.Errorf("journal: sealed segment %q is corrupt at offset %d (size %d): %w; "+
+				"with the server stopped, restore a consistent backup or quarantine this file as %q "+
+				"(quarantine can leave missing or stale file data)",
+				path, validUpTo, info.Size(), errTornRecord, path+".quarantine")
 		}
 	}
 

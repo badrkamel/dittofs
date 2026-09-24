@@ -217,12 +217,19 @@ func fsyncDir(dir string) error {
 	return d.Close()
 }
 
-// sealInPlace makes an appended-into segment immutable: fsync its record bytes,
-// set the on-disk sealed bit, then fsync again.
+// sealInPlace makes an appended-into segment immutable: truncate to its
+// published tail, fsync its record bytes, set the sealed bit, then fsync again.
 // Durability boundary: data is fsynced BEFORE the sealed bit so recovery never
 // trusts a header whose records did not reach disk. The caller moves it into the
 // sealed set. Used both by rotation and by GC when it seals a repack target.
 func (m *segmentMeta) sealInPlace() error {
+	// A failed append can extend the file without publishing a record. A
+	// shorter successful retry overwrites its head but leaves an unowned
+	// suffix. Only complete records advance tail, so discard that suffix
+	// before making the sealed header's durability promise.
+	if err := m.fd.Truncate(m.tail.Load()); err != nil {
+		return fmt.Errorf("journal: truncate before seal: %w", err)
+	}
 	if err := m.fd.Sync(); err != nil {
 		return fmt.Errorf("journal: fsync before seal: %w", err)
 	}

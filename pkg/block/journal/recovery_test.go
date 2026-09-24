@@ -371,6 +371,11 @@ func TestSealedSegmentWithNoValidRecords(t *testing.T) {
 	if !strings.Contains(err.Error(), fmt.Sprintf("%q", s.segPath(badID))) {
 		t.Fatalf("error must identify the damaged segment: %v", err)
 	}
+	for _, guidance := range []string{"server stopped", "consistent backup", "quarantine", "missing or stale file data", fmt.Sprintf("%q", s.segPath(badID)+".quarantine")} {
+		if !strings.Contains(err.Error(), guidance) {
+			t.Errorf("error must include operator guidance %q: %v", guidance, err)
+		}
+	}
 	got, err := os.ReadFile(s.segPath(badID))
 	if err != nil {
 		t.Fatalf("damaged sealed segment must be left in place: %v", err)
