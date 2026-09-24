@@ -14,7 +14,6 @@ import (
 type cloneRangeStore struct {
 	metadata.Store
 	beforeTransaction func()
-	beforeGet         func(metadata.FileHandle)
 }
 
 func (s *cloneRangeStore) WithTransaction(ctx context.Context, fn func(metadata.Transaction) error) error {
@@ -24,13 +23,6 @@ func (s *cloneRangeStore) WithTransaction(ctx context.Context, fn func(metadata.
 		hook()
 	}
 	return s.Store.WithTransaction(ctx, fn)
-}
-
-func (s *cloneRangeStore) GetFile(ctx context.Context, handle metadata.FileHandle) (*metadata.File, error) {
-	if s.beforeGet != nil {
-		s.beforeGet(handle)
-	}
-	return s.Store.GetFile(ctx, handle)
 }
 
 func setCloneTestSize(t *testing.T, ms metadata.Store, handle metadata.FileHandle, size uint64) {
@@ -70,7 +62,7 @@ func TestCloneRangeRevalidatesTransactionSizes(t *testing.T) {
 				setCloneTestSize(t, ms, src, tc.sourceSize)
 				setCloneTestSize(t, ms, dst, tc.destSize)
 			}}
-			err := CloneWholeFileRange(ctx, bs, store, nil, src, dst, "range-dst", 4096)
+			err := CloneWholeFile(ctx, bs, store, nil, src, dst, "range-dst", 4096)
 			var se *metadata.StoreError
 			if !errors.As(err, &se) || se.Code != tc.wantCode {
 				t.Fatalf("clone error = %v, want code %v", err, tc.wantCode)
@@ -96,16 +88,18 @@ func TestLocalCloneRangePreservesGrowthDuringCopy(t *testing.T) {
 	tail := bytes.Repeat([]byte{0x33}, 4096)
 	writeAndSeal(t, ctx, bs, "range-src", source)
 	writeAndSeal(t, ctx, bs, "range-dst", bytes.Repeat([]byte{0x22}, 4096))
-	dstReads := 0
-	store := &cloneRangeStore{Store: ms, beforeGet: func(handle metadata.FileHandle) {
-		if !bytes.Equal(handle, dst) {
-			return
+	grew := false
+	store := &cloneRangeStore{Store: ms, beforeTransaction: func() {
+		// The copy has validated its bounds and written the prefix, but the
+		// final size transaction has not read the destination yet.
+		head := make([]byte, len(source))
+		if _, err := bs.ReadAt(ctx, "range-dst", head, 0); err != nil {
+			t.Fatal(err)
 		}
-		dstReads++
-		if dstReads != 2 {
-			return
+		if !bytes.Equal(head, source) {
+			t.Fatal("growth hook ran before the copied prefix was written")
 		}
-		// Append after the initial bounds check and the copy's data writes.
+		grew = true
 		if _, err := bs.WriteAt(ctx, "range-dst", nil, tail, 4096); err != nil {
 			t.Fatal(err)
 		}
@@ -117,11 +111,11 @@ func TestLocalCloneRangePreservesGrowthDuringCopy(t *testing.T) {
 		}
 		setCloneTestSize(t, ms, dst, 8192)
 	}}
-	if err := CloneWholeFileRange(ctx, bs, store, nil, src, dst, "range-dst", 4096); err != nil {
+	if err := CloneWholeFile(ctx, bs, store, nil, src, dst, "range-dst", 4096); err != nil {
 		t.Fatal(err)
 	}
-	if dstReads != 2 {
-		t.Fatalf("growth hook was not reached: destination reads=%d", dstReads)
+	if !grew {
+		t.Fatal("growth hook was not reached")
 	}
 	after, err := ms.GetFile(ctx, dst)
 	if err != nil {
@@ -148,7 +142,7 @@ func TestLocalCloneRangeRejectsLongerDestination(t *testing.T) {
 	previous := bytes.Repeat([]byte{0x22}, 8192)
 	writeAndSeal(t, ctx, bs, "range-src", bytes.Repeat([]byte{0x11}, 4096))
 	writeAndSeal(t, ctx, bs, "range-dst", previous)
-	err := CloneWholeFileRange(ctx, bs, ms, nil, src, dst, "range-dst", 0)
+	err := CloneWholeFile(ctx, bs, ms, nil, src, dst, "range-dst", 0)
 	var se *metadata.StoreError
 	if !errors.As(err, &se) || se.Code != metadata.ErrNotSupported {
 		t.Fatalf("clone error = %v, want unsupported", err)
