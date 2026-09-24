@@ -62,9 +62,9 @@ func writeAndSeal(t *testing.T, ctx context.Context, bs *engine.Store, payloadID
 	}
 }
 
-// CopyPayload's local fallback shares the whole-source clone bounds. A longer
-// destination cannot be replaced without range-splicing, so refusal must leave
-// both its local content and its manifest intact.
+// CopyPayload's local fallback deliberately shares the whole-source clone
+// contract. It refuses an initially longer destination rather than offering a
+// range copy, and leaves both the local content and manifest intact.
 func TestCopyPayloadLocal_RejectsLongerDestination(t *testing.T) {
 	ctx := context.Background()
 	ms := metadatamemory.NewMemoryMetadataStoreWithDefaults()
