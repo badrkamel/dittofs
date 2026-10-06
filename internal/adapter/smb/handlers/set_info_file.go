@@ -44,13 +44,9 @@ func (h *Handler) setFileInfoFromStore(
 		return setInfoStatus(types.StatusForErr(err)), nil
 	}
 	result, err := common.WithFilePayloadScope(authCtx, metaSvc, blockStore, openFile.MetadataHandle, func(authCtx *metadata.AuthContext) (*SetInfoResponse, error) {
-		var scoped *SMBHandlerContext
-		if ctx != nil {
-			copy := *ctx
-			copy.Context = authCtx.Context
-			scoped = &copy
-		}
-		return h.applyFileInfoFromStore(scoped, authCtx, openFile, class, buffer)
+		// Size operations use authCtx.Context for metadata and payload I/O.
+		// Keep the dispatcher's context so it receives their PostSend hooks.
+		return h.applyFileInfoFromStore(ctx, authCtx, openFile, class, buffer)
 	})
 	if err != nil && result == nil {
 		return setInfoStatus(types.StatusForErr(err)), nil
