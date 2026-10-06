@@ -249,6 +249,11 @@ func (s *Service) RemoveDirectory(ctx *AuthContext, parentHandle FileHandle, nam
 	// so the shared counter key is never a BadgerDB SSI conflict source (#1571).
 	now := time.Now()
 	unlockParent := s.lockParentLink(parentHandle)
+	defer func() {
+		if unlockParent != nil {
+			unlockParent()
+		}
+	}()
 	txErr := withRelaxedTransaction(store, ctx.Context, func(tx Transaction) error {
 		// Re-read the parent inside the transaction so the pre-op snapshot and
 		// the timestamp mutation derive from the same committed state.
@@ -299,8 +304,6 @@ func (s *Service) RemoveDirectory(ctx *AuthContext, parentHandle FileHandle, nam
 
 		return nil
 	})
-	unlockParent()
-
 	if txErr != nil {
 		return nil, txErr
 	}
@@ -322,6 +325,11 @@ func (s *Service) RemoveDirectory(ctx *AuthContext, parentHandle FileHandle, nam
 	// under create-then-rmdir churn (#1573).
 	s.dirTimes.Clear(dirHandle)
 
+	// The timestamp flush writes the parent inode. Keep the counter guard until
+	// it finishes so the next directory mutation cannot read that inode while
+	// this operation is still writing it.
+	unlockParent()
+	unlockParent = nil
 	guard.unlock()
 	s.notifyDirChange(shareNameForHandle(parentHandle), parentHandle, lock.DirChangeRemoveEntry, ctx)
 	return wcc, nil

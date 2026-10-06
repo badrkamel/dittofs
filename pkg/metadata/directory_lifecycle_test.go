@@ -41,7 +41,21 @@ func lifecycleWait(ctx context.Context, site string, handle metadata.FileHandle,
 
 type lifecycleStore struct {
 	metadata.Store
-	inner *badger.BadgerMetadataStore
+	inner         *badger.BadgerMetadataStore
+	beforeDurable func(context.Context)
+	afterDurable  func(context.Context, error)
+	beforeRelaxed func(context.Context)
+}
+
+func (s *lifecycleStore) WithTransaction(ctx context.Context, fn func(metadata.Transaction) error) error {
+	if s.beforeDurable != nil {
+		s.beforeDurable(ctx)
+	}
+	err := s.Store.WithTransaction(ctx, fn)
+	if s.afterDurable != nil {
+		s.afterDurable(ctx, err)
+	}
+	return err
 }
 
 func (s *lifecycleStore) GetChild(ctx context.Context, parent metadata.FileHandle, name string) (metadata.FileHandle, error) {
@@ -57,6 +71,9 @@ func (s *lifecycleStore) ListChildren(ctx context.Context, parent metadata.FileH
 }
 
 func (s *lifecycleStore) WithTransactionRelaxed(ctx context.Context, fn func(metadata.Transaction) error) error {
+	if s.beforeRelaxed != nil {
+		s.beforeRelaxed(ctx)
+	}
 	return s.inner.WithTransactionRelaxed(ctx, func(tx metadata.Transaction) error {
 		return fn(lifecycleTransaction{Transaction: tx})
 	})

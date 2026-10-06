@@ -1379,6 +1379,11 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 	if srcFile.Type == FileTypeDirectory && !sameDir {
 		unlockParents = s.lockParentLinks(fromDir, toDir)
 	}
+	defer func() {
+		if unlockParents != nil {
+			unlockParents()
+		}
+	}()
 
 	// Execute all write operations in a single transaction for better performance.
 	// Relaxed durability (#1573 Wall 1): rename rewrites only directory entries
@@ -1622,10 +1627,6 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 
 		return nil
 	})
-	if unlockParents != nil {
-		unlockParents()
-	}
-
 	if txErr != nil {
 		return nil, nil, txErr
 	}
@@ -1662,6 +1663,13 @@ func (s *Service) Move(ctx *AuthContext, fromDir FileHandle, fromName string, to
 	}
 	if dstFile != nil && dstFile.Type == FileTypeDirectory {
 		s.dirTimes.Clear(dstHandle)
+	}
+	// Coalesced timestamp persistence still writes the parents after the
+	// namespace commit. Keep directory counter exclusion across that flush;
+	// otherwise the next rename can conflict with this operation's final write.
+	if unlockParents != nil {
+		unlockParents()
+		unlockParents = nil
 	}
 	guard.unlock()
 

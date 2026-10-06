@@ -554,10 +554,11 @@ func (s *Service) recordDirTimes(ctx context.Context, dirHandle FileHandle, t ti
 }
 
 // flushDirTimes durably persists a directory's coalesced timestamps in a
-// dedicated transaction, serialized per-directory. Because create/remove no
-// longer touch the parent inode, this write never conflicts with concurrent
-// same-dir mutations. Best-effort: a failure (e.g. the directory was removed)
-// leaves the bump to be retried or dropped, never failing the caller.
+// dedicated transaction, serialized per-directory. Namespace mutations read
+// the parent inode, so a flush can conflict with those reads. Directory
+// operations retain their parent counter guards through this write to exclude
+// the next serialized mutation. Best-effort: a failure leaves the bump to be
+// retried or dropped, never failing the caller.
 func (s *Service) flushDirTimes(ctx context.Context, dirHandle FileHandle) {
 	lock := s.dirTimes.FlushLock(dirHandle)
 	lock.Lock()
