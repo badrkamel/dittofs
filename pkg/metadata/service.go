@@ -76,6 +76,11 @@ type Service struct {
 	// lockCreateName.
 	createNameShards [parentLinkShardCount]sync.Mutex
 
+	// namespaceShards pin directory lifetimes across child mutations. Shared
+	// admission keeps distinct creates concurrent; deletion and directory moves
+	// exclude them until their namespace and cache updates are complete.
+	namespaceShards [parentLinkShardCount]sync.RWMutex
+
 	cookies *CookieManager // NFS/SMB cookie to store token translation
 
 	// identityQuotas holds hot-updatable per-user / per-group quota limits,

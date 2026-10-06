@@ -16,8 +16,8 @@ import (
 // holds it via the Store interface (RegisterStoreForShare), so the override is
 // actually dispatched. Note: it observes store.GetFile only; parent reads that
 // went through tx.GetFile inside a transaction would not be counted here. The
-// create path deliberately does not read the parent inode inside its
-// transaction (#1573), so every parent read is a store.GetFile and is caught.
+// transactional lifetime recheck is separate from the preflight permission
+// reads counted by this wrapper.
 type countingStore struct {
 	*memory.MemoryMetadataStore
 	total  atomic.Int64
@@ -30,8 +30,8 @@ func (c *countingStore) GetFile(ctx context.Context, h metadata.FileHandle) (*me
 	return c.MemoryMetadataStore.GetFile(ctx, h)
 }
 
-// TestCreateFile_ParentGetFileDedup pins the parent-inode read dedup (#1737):
-// a single CreateFile must load the parent handle exactly once, not three times.
+// TestCreateFile_ParentGetFileDedup pins preflight parent-read deduplication:
+// create and permission checks share one read before the transaction.
 func TestCreateFile_ParentGetFileDedup(t *testing.T) {
 	t.Parallel()
 
@@ -80,11 +80,10 @@ func TestCreateFile_ParentGetFileDedup(t *testing.T) {
 	parentReads := cs.perKey[string(dirHandle)]
 	t.Logf("CreateFile: total GetFile=%d, parent GetFile=%d", cs.total.Load(), parentReads)
 
-	// After the dedup the parent inode is loaded exactly once. Before #1737 it
-	// was loaded three times (createEntry + CheckParentCreateAccess +
-	// checkWritePermission). Guard against silent regression.
+	// The preflight parent read is shared by createEntry and permission checks.
+	// The transaction separately verifies that the directory still exists.
 	require.Equal(t, int64(1), parentReads,
-		"parent inode must be loaded exactly once per CreateFile (was 3 before #1737)")
+		"parent inode must be loaded exactly once during create preflight")
 }
 
 // BenchmarkCreateFile creates children in one directory via the fixture,
