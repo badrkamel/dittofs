@@ -13,6 +13,59 @@ import (
 	"github.com/marmos91/dittofs/pkg/block/journal"
 )
 
+// warmRegistry lets shutdown cancel warm work before waiting for lifecycle
+// readers. A progress callback may itself call Close while another worker is
+// downloading under a lifecycle pin, so cancellation cannot wait for that pin.
+// Only warm runs register here; ordinary data operations still drain normally.
+type warmRegistry struct {
+	mu      sync.Mutex
+	closing bool
+	runs    map[*warmRun]struct{}
+}
+
+type warmRun struct {
+	cancel context.CancelCauseFunc
+}
+
+// Distinguish shutdown from a caller cancelling with its own error cause.
+var errWarmShutdown = errors.New("engine: warm stopped by shutdown")
+
+func (r *warmRegistry) begin(ctx context.Context) (context.Context, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return ctx, nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closing {
+		return ctx, nil, ErrStoreClosed
+	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	run := &warmRun{cancel: cancel}
+	if r.runs == nil {
+		r.runs = make(map[*warmRun]struct{})
+	}
+	r.runs[run] = struct{}{}
+	return ctx, func() {
+		r.mu.Lock()
+		delete(r.runs, run)
+		r.mu.Unlock()
+		cancel(nil)
+	}, nil
+}
+
+func (r *warmRegistry) stop() {
+	r.mu.Lock()
+	r.closing = true
+	runs := make([]*warmRun, 0, len(r.runs))
+	for run := range r.runs {
+		runs = append(runs, run)
+	}
+	r.mu.Unlock()
+	for _, run := range runs {
+		run.cancel(errWarmShutdown)
+	}
+}
+
 // WarmResult summarizes a WarmAll run: how many chunks came back from the
 // remote tier and how many bytes they moved. Sparse, removed and unsynced rows
 // count toward progress but not BlocksFetched. See WarmAll for why there is no
@@ -243,12 +296,12 @@ func (m *RemoteSync) warmAll(ctx context.Context, progress func(done, total int6
 	for range workers {
 		g.Go(func() error {
 			for {
-				if err := gctx.Err(); err != nil {
-					return err
-				}
 				i := int(next.Add(1) - 1)
 				if i >= len(targets) {
-					return nil
+					return nil // A final callback may close a fully completed run.
+				}
+				if err := gctx.Err(); err != nil {
+					return err
 				}
 				target := targets[i]
 				data, err := func() ([]byte, error) {
