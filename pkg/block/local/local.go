@@ -163,6 +163,11 @@ type LocalStore interface {
 	// eviction backpressure signal.
 	UnsyncedBytes() int64
 
+	// HasDirty reports whether the file still has bytes awaiting a manifest
+	// commit. Callers deciding to replace a payload must also exclude writers
+	// and in-flight flushes while inspecting this answer.
+	HasDirty(ctx context.Context, id journal.FileID) (bool, error)
+
 	// UploadConcurrency and BlockSize report the flush shape the tier was
 	// configured for: how many block uploads a pass may hold in flight, and the
 	// target carve block size. A non-positive answer means the tier has no

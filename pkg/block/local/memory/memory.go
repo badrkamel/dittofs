@@ -11,6 +11,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/marmos91/dittofs/pkg/block"
 	"github.com/marmos91/dittofs/pkg/block/journal"
@@ -34,6 +35,7 @@ type memFile struct {
 	buf      []byte
 	unsynced int64
 	written  [][2]int64
+	version  uint64
 }
 
 // addWritten records [start, end) as written, coalescing it with any range it
@@ -72,6 +74,9 @@ func (f *memFile) clipWritten(newSize int64) {
 type MemoryStore struct {
 	mu    sync.RWMutex
 	files map[string]*memFile
+	// Flush locks belong to file IDs, not memFile instances, so deleting and
+	// recreating a file cannot let its new pass overtake an older callback.
+	flushLocks [64]sync.Mutex
 
 	unsynced atomic.Int64
 	durable  atomic.Bool
@@ -101,6 +106,7 @@ func (s *MemoryStore) writeLocked(payloadID string, offset int64, data []byte) i
 	}
 	copy(f.buf[offset:end], data)
 	f.addWritten(offset, end)
+	f.version++
 	return int64(len(data))
 }
 
@@ -279,6 +285,7 @@ func (s *MemoryStore) Truncate(_ context.Context, id journal.FileID, newSize int
 	}
 	f.buf = f.buf[:newSize]
 	f.clipWritten(newSize)
+	f.version++
 	return nil
 }
 
@@ -312,7 +319,16 @@ func (s *MemoryStore) Flush(ctx context.Context, id journal.FileID, opts journal
 	if fn == nil {
 		return errors.New("memory: Flush requires fn")
 	}
+	release, err := s.acquireFlush(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer release()
 	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return block.ErrStoreClosed
+	}
 	var ids []string
 	if f := s.files[string(id)]; f != nil && f.unsynced > 0 {
 		ids = []string{string(id)}
@@ -327,28 +343,24 @@ func (s *MemoryStore) Flush(ctx context.Context, id journal.FileID, opts journal
 		s.mu.RLock()
 		f := s.files[fid]
 		var data []byte
+		var version uint64
 		if f != nil {
 			data = append([]byte(nil), f.buf...)
+			version = f.version
 		}
 		s.mu.RUnlock()
 		if len(data) == 0 {
 			continue
 		}
-		// Offer the whole dirty file as one run and flip whatever fn reports
-		// durable. A failure still credits the committed prefix (the C5 shape:
-		// durable extents ride the error), so a retry never re-offers bytes the
-		// sink already took.
+		// Offer the whole dirty file as one run. Credit applies only to this
+		// snapshot: a concurrent mutation leaves the file dirty for another pass.
 		extents, ferr := fn(ctx, journal.Run{
 			ID:       journal.FileID(fid),
 			Extent:   journal.Extent{Off: 0, Len: int64(len(data)), State: journal.StateDirty},
 			Final:    true,
 			ReaderAt: bytes.NewReader(data),
 		})
-		for _, e := range extents {
-			if end := e.Off + e.Len; end <= int64(len(data)) {
-				s.markCarvedRange(fid, e.Off, end)
-			}
-		}
+		s.markCarvedSnapshot(fid, f, version, int64(len(data)), extents)
 		if ferr != nil && firstErr == nil {
 			firstErr = ferr
 		}
@@ -356,22 +368,69 @@ func (s *MemoryStore) Flush(ctx context.Context, id journal.FileID, opts journal
 	return firstErr
 }
 
-// markCarvedRange clears the file's unsynced charge over [off, end).
-func (s *MemoryStore) markCarvedRange(fid string, off, end int64) {
+// acquireFlush serializes a file's snapshot, sink callback, and dirty credit.
+// A version check on credit alone cannot stop an old callback from publishing
+// after a newer pass has committed its rows and already cleared dirty state.
+//
+// ponytail: 64 stripes bound lock memory and concurrent flushes. Collisions
+// serialize unrelated files until the upload completes, while reads and writes
+// remain independent. Use retiring per-file locks if memory-backed workloads
+// need more flush concurrency than this bound provides.
+func (s *MemoryStore) acquireFlush(ctx context.Context, id journal.FileID) (func(), error) {
+	var hash uint64 = 14695981039346656037
+	for i := 0; i < len(id); i++ {
+		hash = (hash ^ uint64(id[i])) * 1099511628211
+	}
+	mu := &s.flushLocks[hash%uint64(len(s.flushLocks))]
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if mu.TryLock() {
+			return mu.Unlock, nil
+		}
+		timer := time.NewTimer(5 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// markCarvedSnapshot clears only a fully durable, unchanged snapshot.
+//
+// ponytail: memory keeps a dirty byte count, not versioned dirty ranges. A
+// partial report cannot identify which charged bytes it covered, so it leaves
+// the whole file dirty and the next pass may re-offer durable bytes. Track dirty
+// ranges if partial-progress efficiency becomes necessary for this local tier.
+func (s *MemoryStore) markCarvedSnapshot(fid string, snapshot *memFile, version uint64, size int64, extents []journal.Extent) {
+	var spans [][2]int64
+	for _, e := range extents {
+		if e.Off >= 0 && e.Len > 0 && e.Off <= size && e.Len <= size-e.Off {
+			spans = append(spans, [2]int64{e.Off, e.Off + e.Len})
+		}
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i][0] < spans[j][0] })
+	var covered int64
+	for _, span := range spans {
+		if span[0] > covered {
+			return
+		}
+		covered = max(covered, span[1])
+	}
+	if covered < size {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	f := s.files[fid]
-	if f == nil {
+	if f != snapshot || f == nil || f.version != version {
 		return
 	}
-	n := end - off
-	if n > f.unsynced {
-		n = f.unsynced
-	}
-	if n > 0 {
-		f.unsynced -= n
-		s.unsynced.Add(-n)
-	}
+	s.unsynced.Add(-f.unsynced)
+	f.unsynced = 0
 }
 
 // UnsyncedBytes reports bytes not yet carved to the sink.
@@ -380,6 +439,21 @@ func (s *MemoryStore) UnsyncedBytes() int64 {
 		return v
 	}
 	return 0
+}
+
+// HasDirty reports pending bytes for this file. A fully truncated file has no
+// bytes to offer, even when its old unsynced accounting has not been drained.
+func (s *MemoryStore) HasDirty(ctx context.Context, id journal.FileID) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return false, block.ErrStoreClosed
+	}
+	f := s.files[string(id)]
+	return f != nil && len(f.buf) > 0 && f.unsynced > 0, nil
 }
 
 // Evict is a no-op: memory never evicts.

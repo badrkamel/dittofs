@@ -135,6 +135,29 @@ func (s *Store) Extents(ctx context.Context, id FileID) ([]Extent, error) {
 	return out, nil
 }
 
+// HasDirty checks the current intervals, including writes newer than the last
+// flush snapshot. A completed flush alone cannot prove a concurrently written
+// file's manifest is current: its newer intervals deliberately remain dirty.
+func (s *Store) HasDirty(ctx context.Context, id FileID) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if s.closed.Load() {
+		return false, errClosed
+	}
+	sh := s.shardFor(id)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if fi := sh.index[id]; fi != nil {
+		for _, iv := range fi.ivs {
+			if !iv.synced && !iv.cold {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // demote is the one residency-loss chokepoint: it persists the cold markers to
 // stable storage and only then runs flip, which takes the intervals
 // resident→remote. appendCold fsyncs before returning, so by the time flip

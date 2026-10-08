@@ -116,7 +116,9 @@ func (s *Store) Flush(ctx context.Context, id FileID, opts FlushOptions, fn Flus
 	}
 
 	sh := s.shardFor(id)
-	sh.flushMu.Lock()
+	if err := sh.lockFlush(ctx); err != nil {
+		return err
+	}
 	defer sh.flushMu.Unlock()
 
 	// Snapshot the file's live dirty intervals (short section). fn runs with
@@ -205,6 +207,27 @@ func (s *Store) Flush(ctx context.Context, id FileID, opts FlushOptions, fn Flus
 	}
 	s.maybeResetDirtyClock(sh, id)
 	return firstErr
+}
+
+// lockFlush lets an explicit drain honor its deadline while another file on
+// the shard is uploading. Other shard maintenance still uses the same mutex,
+// so cancellation changes admission only, never the serialization contract.
+func (sh *shard) lockFlush(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if sh.flushMu.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(5 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // splitRuns groups a file's dirty interval snapshot into contiguous runs,

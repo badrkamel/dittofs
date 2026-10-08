@@ -456,18 +456,13 @@ func (bs *Store) DrainLocalSynced(ctx context.Context) (journal.EvictResult, err
 	return bs.local.Evict(ctx, 1<<62)
 }
 
-// WarmAll proactively fetches every remote block of every payload in this
-// share onto the local CAS tier, delegating to the syncer's WarmAll under the
-// store's close-gate so a concurrent Close drains the run instead of racing
-// the local/syncer/remote teardown. See (*RemoteSync).WarmAll for semantics
-// (bounded by ParallelDownloads, errors on a missing remote, terminal on
-// ErrDiskFull, honors ctx cancellation). progress may be nil.
+// WarmAll materializes this share's remote chunks with bounded downloads.
+// Planning and each fetch separately pin the engine lifecycle; callbacks run
+// outside those pins so they may call engine methods even when Close is queued.
+// Close drains active scopes and subsequent warm workers return ErrStoreClosed.
+// See (*RemoteSync).WarmAll for progress and replacement semantics.
 func (bs *Store) WarmAll(ctx context.Context, progress func(done, total int64)) (WarmResult, error) {
-	if err := bs.enter(); err != nil {
-		return WarmResult{}, err
-	}
-	defer bs.closeMu.RUnlock()
-	return bs.syncer.WarmAll(ctx, progress)
+	return bs.syncer.warmAll(ctx, progress, bs.enterPayload, bs.ObservePayload)
 }
 
 // loadCache returns the current cache under cacheMu. Always non-nil (Null
