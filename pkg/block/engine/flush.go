@@ -809,8 +809,8 @@ func (bs *Store) CommitLocal(ctx context.Context, payloadID string) error {
 	return bs.local.Commit(ctx, journal.FileID(payloadID))
 }
 
-// HasDirty reports bytes newer than the committed manifest. An exclusive
-// payload scope makes the answer stable until the caller finishes replacement.
+// HasDirty reports dirty bytes or unfinished manifest publication/reaping. An
+// exclusive payload scope keeps the answer stable through replacement.
 func (bs *Store) HasDirty(ctx context.Context, payloadID string) (bool, error) {
 	ctx, release, err := bs.enterPayload(ctx, payloadID)
 	if err != nil {

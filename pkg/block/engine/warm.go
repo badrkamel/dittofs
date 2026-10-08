@@ -40,9 +40,9 @@ type warmFile struct {
 	chunks    map[string]warmChunk
 }
 
-// warmTarget keeps the originally enumerated row ID, not its content. A
-// replacement at that ID is resolved under admission when the worker runs;
-// removed IDs become processed skips and new IDs wait for the next warm run.
+// warmTarget keeps the originally enumerated row ID, not its content. An
+// exclusive replacement at that ID is resolved under admission when the worker
+// runs; removed IDs become processed skips and new IDs wait for the next run.
 type warmTarget struct {
 	file *warmFile
 	id   string
@@ -54,7 +54,21 @@ type warmObserve func(context.Context, string) (func() uint64, func(), error)
 // snapshot resolves all rows and their overlap bounds while the caller owns
 // shared payload admission. Its returned IDs define this run's fixed work list.
 func (f *warmFile) snapshot(ctx context.Context, m *RemoteSync) ([]string, error) {
+	// A write arriving after the dirty check must be newer than this bound.
 	at := m.local.WriteVersion()
+	dirty, err := m.local.HasDirty(ctx, journal.FileID(f.payloadID))
+	if err != nil {
+		return nil, fmt.Errorf("warm: inspect dirty data for %s: %w", f.payloadID, err)
+	}
+	if dirty {
+		// decision: dirty bytes or an unfinished reap can predate this snapshot
+		// while manifest rows still describe old contents. Carving and eviction
+		// keep their version, so the initial bound excludes every recorded cold
+		// interval. Fetch/count every planned row, but leave this dirty file's
+		// cold ranges for demand reads or a later warm run. Range-level dirty
+		// provenance would let a future warmer fill its unchanged cold ranges.
+		at = 0
+	}
 	rows, err := m.listFileChunksSnapshot(ctx, f.payloadID)
 	if err != nil {
 		return nil, fmt.Errorf("warm: list blocks for %s: %w", f.payloadID, err)
@@ -108,10 +122,10 @@ func (f *warmFile) resolve(ctx context.Context, m *RemoteSync, id string) (warmC
 	return f.chunks[id], nil
 }
 
-// WarmAll proactively materializes every enumerated remote chunk in this share
-// onto the local tier. Authoritative FileChunk metadata also finds payloads
-// whose local journal has been discarded after upload. Downloads are bounded
-// by ParallelDownloads and admission covers only a worker's current file.
+// WarmAll proactively fetches this share's planned remote chunks and fills
+// eligible ranges in the local tier. Authoritative FileChunk metadata also finds
+// payloads whose local journal has been discarded after upload. Downloads are
+// bounded by ParallelDownloads; admission covers only a worker's current file.
 //
 // decision: warm attempts every planned row, including already-resident
 // ranges, so progress describes the manifest walk and fetched counts describe
@@ -120,9 +134,13 @@ func (f *warmFile) resolve(ctx context.Context, m *RemoteSync, id string) (warmC
 //
 // progress (may be nil) receives ordered (done, total) counts, starting at zero.
 // total counts the valid row IDs found during planning. Removed rows are
-// processed skips, replacements at the same ID use current content, and newly
-// added IDs wait for another run. Callbacks run synchronously on the caller,
-// outside all lifecycle and payload pins, and may inspect or mutate the engine.
+// processed skips, exclusive replacements at the same ID use current content,
+// and newly added IDs wait for another run. Ordinary writes after planning are
+// fenced by the sampled journal version. Files with dirty or unpublished data
+// at planning use the initial zero bound: their manifest can predate writes or
+// still hold rows awaiting reap. Either case can leave cold ranges for a demand
+// read or another warm run. Callbacks run synchronously on the caller, outside
+// all lifecycle and payload pins, and may inspect or mutate the engine.
 // Every worker is joined and every callback has finished before return. A
 // callback panic propagates after active workers are cancelled and joined.
 //

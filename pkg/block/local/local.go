@@ -96,7 +96,8 @@ type LocalStore interface {
 	// notAfter is the write version sampled before the caller resolved which
 	// remote bytes to fetch. The write-back is dropped when the range changed
 	// since, so a fetch stalled across a write, truncate or punch cannot put
-	// the pre-mutation bytes back. Zero disables the gate.
+	// the pre-mutation bytes back. Zero is the initial version of an empty
+	// store and must still reject intervals created by later mutations.
 	Hydrate(ctx context.Context, id journal.FileID, offset int64, data []byte, notAfter uint64) error
 
 	// SeedCold and SeedColdBatch mark extents remote-durable-but-not-local, so
@@ -163,9 +164,9 @@ type LocalStore interface {
 	// eviction backpressure signal.
 	UnsyncedBytes() int64
 
-	// HasDirty reports whether the file still has bytes awaiting a manifest
-	// commit. Callers deciding to replace a payload must also exclude writers
-	// and in-flight flushes while inspecting this answer.
+	// HasDirty reports dirty bytes or a flush still publishing/reaping the
+	// file's manifest. Callers deciding to replace a payload must also exclude
+	// writers and in-flight flushes while inspecting this answer.
 	HasDirty(ctx context.Context, id journal.FileID) (bool, error)
 
 	// UploadConcurrency and BlockSize report the flush shape the tier was

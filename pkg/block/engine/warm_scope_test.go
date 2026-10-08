@@ -591,3 +591,158 @@ func TestWarmScopeProgressPanicDrainsCompletions(t *testing.T) {
 	defer f.bs.admission.mu.Unlock()
 	require.Empty(t, f.bs.admission.entries)
 }
+
+func TestWarmScopeOrdinaryOverwriteAfterPlan(t *testing.T) {
+	for _, initialNonzero := range []bool{false, true} {
+		t.Run(fmt.Sprintf("nonzero_%t", initialNonzero), func(t *testing.T) {
+			f := newWarmScopeFixture(t)
+			ctx := context.Background()
+			if initialNonzero {
+				_, err := f.bs.ReadAt(ctx, "warm-src", make([]byte, len(f.source)), 0)
+				require.NoError(t, err)
+				_, err = f.bs.DrainLocalSynced(ctx)
+				require.NoError(t, err)
+				require.NotZero(t, f.bs.local.WriteVersion())
+			} else {
+				require.Zero(t, f.bs.local.WriteVersion())
+			}
+			fresh := bytes.Repeat([]byte{0x7f}, len(f.source))
+			var mutationErr error
+			_, err := f.bs.WarmAll(ctx, func(done, total int64) {
+				if done != 0 {
+					return
+				}
+				_, mutationErr = f.bs.WriteAt(ctx, "warm-src", nil, fresh, 0)
+				if mutationErr != nil {
+					return
+				}
+				mutationErr = f.rs.SyncNow(ctx)
+				if mutationErr != nil {
+					return
+				}
+				row, rowErr := f.metadata.GetFileChunk(ctx, f.srcRow.ID)
+				require.NoError(t, rowErr)
+				require.NotEqual(t, f.srcRow.Hash, row.Hash, "the overwrite must have replaced the remote manifest")
+				evicted, evictErr := f.bs.DrainLocalSynced(ctx)
+				mutationErr = evictErr
+				require.Greater(t, evicted.SegmentsEvicted, 0)
+				resident, residentErr := f.bs.local.IsRangeResident(ctx, "warm-src", 0, int64(len(fresh)))
+				require.NoError(t, residentErr)
+				require.False(t, resident)
+			})
+			require.NoError(t, mutationErr)
+			require.NoError(t, err)
+			got := make([]byte, len(fresh))
+			_, err = f.bs.ReadAt(ctx, "warm-src", got, 0)
+			require.NoError(t, err)
+			require.True(t, bytes.Equal(fresh, got), "planned stale row replaced a newer carved cold interval: got %#x, want %#x", got[0], fresh[0])
+		})
+	}
+}
+
+func TestWarmScopeAlreadyDirtyOverwriteAtPlan(t *testing.T) {
+	f := newWarmScopeFixture(t)
+	ctx := context.Background()
+	fresh := bytes.Repeat([]byte{0x7f}, len(f.source))
+	_, err := f.bs.WriteAt(ctx, "warm-src", nil, fresh, 0)
+	require.NoError(t, err)
+	before, err := f.metadata.GetFileChunk(ctx, f.srcRow.ID)
+	require.NoError(t, err)
+	require.Equal(t, f.srcRow.Hash, before.Hash)
+	require.NotZero(t, f.bs.local.WriteVersion())
+	var mutationErr error
+	var counts [][2]int64
+	result, err := f.bs.WarmAll(ctx, func(done, total int64) {
+		counts = append(counts, [2]int64{done, total})
+		if done != 0 {
+			return
+		}
+		mutationErr = f.rs.SyncNow(ctx)
+		if mutationErr != nil {
+			return
+		}
+		row, rowErr := f.metadata.GetFileChunk(ctx, f.srcRow.ID)
+		require.NoError(t, rowErr)
+		require.NotEqual(t, f.srcRow.Hash, row.Hash)
+		evicted, evictErr := f.bs.DrainLocalSynced(ctx)
+		mutationErr = evictErr
+		require.Greater(t, evicted.SegmentsEvicted, 0)
+		resident, residentErr := f.bs.local.IsRangeResident(ctx, "warm-src", 0, int64(len(fresh)))
+		require.NoError(t, residentErr)
+		require.False(t, resident)
+	})
+	require.NoError(t, mutationErr)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, result.BlocksFetched, "the conservative bound must preserve download accounting")
+	require.Equal(t, [][2]int64{{0, 2}, {1, 2}, {2, 2}}, counts)
+	got := make([]byte, len(fresh))
+	_, err = f.bs.ReadAt(ctx, "warm-src", got, 0)
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(fresh, got), "overwrite dirty before plan came back stale: got %#x, want %#x", got[0], fresh[0])
+}
+
+func TestWarmScopePlanningDuringManifestReap(t *testing.T) {
+	f := newWarmScopeFixture(t)
+	ctx := context.Background()
+	stale := *f.dstRow
+	stale.ID = "warm-src/2048"
+	stale.DataSize = 2048
+	require.NoError(t, f.metadata.Put(ctx, &stale))
+	fresh := bytes.Repeat([]byte{0x7f}, len(f.source))
+	_, err := f.bs.WriteAt(ctx, "warm-src", nil, fresh, 0)
+	require.NoError(t, err)
+	afterFile := make(chan struct{})
+	resume := make(chan struct{})
+	var resumeOnce sync.Once
+	unpause := func() { resumeOnce.Do(func() { close(resume) }) }
+	t.Cleanup(unpause)
+	flushed := make(chan error, 1)
+	go func() {
+		flushed <- f.bs.WithPayloadScope(ctx, []string{"warm-src"}, false, func(ctx context.Context) error {
+			fn, reap := f.rs.flushFn()
+			return f.bs.local.Flush(ctx, "warm-src", journal.FlushOptions{Force: true, AfterFile: func(ctx context.Context, id journal.FileID) error {
+				close(afterFile)
+				<-resume
+				return reap(ctx, id)
+			}}, fn)
+		})
+	}()
+	select {
+	case <-afterFile:
+	case <-time.After(5 * time.Second):
+		t.Fatal("flush never reached AfterFile")
+	}
+	require.Zero(t, f.bs.local.UnsyncedBytes(), "records should already be marked synced")
+	rows, err := f.metadata.ListFileChunks(ctx, "warm-src")
+	require.NoError(t, err)
+	require.Len(t, rows, 2, "the obsolete interior row must still be awaiting reap")
+	row, err := f.metadata.GetFileChunk(ctx, stale.ID)
+	require.NoError(t, err)
+	require.Equal(t, stale.Hash, row.Hash)
+	var phaseErr error
+	_, err = f.bs.WarmAll(ctx, func(done, total int64) {
+		if done != 0 {
+			return
+		}
+		require.EqualValues(t, 3, total)
+		unpause()
+		phaseErr = waitWarmScope(t, flushed)
+		if phaseErr != nil {
+			return
+		}
+		rows, phaseErr = f.metadata.ListFileChunks(ctx, "warm-src")
+		if phaseErr != nil {
+			return
+		}
+		require.Len(t, rows, 1, "reap should remove the obsolete interior row")
+		evicted, evictErr := f.bs.DrainLocalSynced(ctx)
+		phaseErr = evictErr
+		require.Greater(t, evicted.SegmentsEvicted, 0)
+	})
+	require.NoError(t, phaseErr)
+	require.NoError(t, err)
+	got := make([]byte, len(fresh))
+	_, err = f.bs.ReadAt(ctx, "warm-src", got, 0)
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(fresh, got), "interior row awaiting reap restored stale bytes: got %#x at2048, want %#x", got[2048], fresh[2048])
+}

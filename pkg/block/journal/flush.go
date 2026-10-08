@@ -137,10 +137,18 @@ func (s *Store) Flush(ctx context.Context, id FileID, opts FlushOptions, fn Flus
 			}
 		}
 	}
+	if len(snap) != 0 {
+		sh.flushing, sh.flushingID = true, id
+	}
 	sh.mu.Unlock()
 	if len(snap) == 0 {
 		return nil
 	}
+	defer func() {
+		sh.mu.Lock()
+		sh.flushing, sh.flushingID = false, ""
+		sh.mu.Unlock()
+	}()
 
 	minSize, maxAge := opts.MinSize, opts.MaxAge
 	if !opts.Force && minSize == 0 && maxAge == 0 {

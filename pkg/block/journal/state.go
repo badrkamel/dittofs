@@ -135,9 +135,10 @@ func (s *Store) Extents(ctx context.Context, id FileID) ([]Extent, error) {
 	return out, nil
 }
 
-// HasDirty checks the current intervals, including writes newer than the last
-// flush snapshot. A completed flush alone cannot prove a concurrently written
-// file's manifest is current: its newer intervals deliberately remain dirty.
+// HasDirty reports dirty intervals or a flush still publishing its manifest.
+// The publication guard includes AfterFile: synced bytes can still have stale
+// interior rows awaiting reap. Writes newer than the flush snapshot remain
+// dirty after the pass ends and are included in the answer as well.
 func (s *Store) HasDirty(ctx context.Context, id FileID) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -148,6 +149,9 @@ func (s *Store) HasDirty(ctx context.Context, id FileID) (bool, error) {
 	sh := s.shardFor(id)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
+	if sh.flushing && sh.flushingID == id {
+		return true, nil
+	}
 	if fi := sh.index[id]; fi != nil {
 		for _, iv := range fi.ivs {
 			if !iv.synced && !iv.cold {
