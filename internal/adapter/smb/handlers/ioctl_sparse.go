@@ -605,15 +605,16 @@ func (h *Handler) zeroFillRange(authCtx *metadata.AuthContext, openFile *OpenFil
 	committed, err := common.WithFilePayloadScope(authCtx, metaSvc, blockStore, openFile.MetadataHandle, func(authCtx *metadata.AuthContext) (bool, error) {
 		chunkLen := min(uint64(zeroFillChunkSize), end-start)
 		zeros := make([]byte, chunkLen)
-		// One deadline for every chunk the range is written in, not one per chunk.
-		// The cancel check below stays on the request's own context, so a client
-		// cancel is still told apart from the deadline ending a write.
+		// One deadline for every chunk the range is written in, not one per chunk:
+		// the scope's, since WithRequestDeadline keeps it. The cancel check below
+		// stays on the request's own context, so a client cancel is still told
+		// apart from the deadline ending a write.
 		writeCtx, cancel := common.WithRequestDeadline(authCtx.Context)
 		defer cancel()
 
 		committed := false
 		for offset := start; offset < end; {
-			if err := authCtx.Context.Err(); err != nil {
+			if err := reqCtx.Err(); err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return committed, errZeroFillCancelled
 				}
