@@ -712,7 +712,7 @@ func TestWarmScopePlanningDuringManifestReap(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("flush never reached AfterFile")
 	}
-	require.Zero(t, f.bs.local.UnsyncedBytes(), "records should already be marked synced")
+	require.Positive(t, f.bs.local.UnsyncedBytes(), "bytes must stay dirty until manifest reap succeeds")
 	rows, err := f.metadata.ListFileChunks(ctx, "warm-src")
 	require.NoError(t, err)
 	require.Len(t, rows, 2, "the obsolete interior row must still be awaiting reap")

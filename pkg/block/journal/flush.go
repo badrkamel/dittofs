@@ -42,14 +42,16 @@ type FlushOptions struct {
 	MinSize int64
 	// Force offers the file regardless of the age/size gates.
 	Force bool
-	// AfterFile runs once per file after the last flip, WHILE journal still
-	// holds the shard's flush lock — on success, on a partial-credit error and
-	// on cancellation alike. The manifest reap belongs here: releasing the
-	// lock before it re-introduces the re-entrant-pass corruption where a
-	// second pass commits a row inside the first pass's about-to-be-reaped
+	// AfterFile runs once per file after the last run, before durable credit,
+	// WHILE journal still holds the shard's flush lock — on success, on a
+	// partial-credit error and on cancellation alike. The manifest reap belongs
+	// here: releasing the lock before it lets a second pass commit a row inside
+	// the first pass's about-to-be-reaped
 	// span and the delayed reap then deletes that load-bearing row. It needs
 	// no parameters beyond the id: fn and AfterFile share the caller's
-	// closure, so the state the reap needs is already in scope.
+	// closure, so the state the reap needs is already in scope. An error or
+	// panic leaves the offered bytes dirty: a later fresh pass retries their
+	// publication instead of retaining this pass's callback.
 	AfterFile func(ctx context.Context, id FileID) error
 }
 
@@ -84,11 +86,15 @@ type FlushFunc func(ctx context.Context, r Run) ([]Extent, error)
 //     dirty for the next pass. The version check is journal's own bookkeeping
 //     — Extent carries no version and fn never sees one.
 //   - A non-empty durable slice TOGETHER with a non-nil error means "these
-//     committed, then I failed": journal flips the validated extents, stops
-//     offering runs for the file, still calls AfterFile (the committed prefix
-//     must be reaped), then returns the error.
-//   - On ctx cancellation journal stops offering runs, flips whatever was
-//     already validated, and still calls AfterFile.
+//     committed, then I failed": journal stops offering runs for the file,
+//     calls AfterFile, flips the validated prefix only if AfterFile succeeds,
+//     then returns the error.
+//   - On ctx cancellation journal stops offering runs and still calls
+//     AfterFile. Successfully published credit flips despite cancellation.
+//   - All reported credit waits for AfterFile to succeed. On its error or
+//     panic the offered bytes stay dirty and cannot be evicted while their
+//     manifest still contains superseded rows. The next pass retries from
+//     current bytes with fresh callbacks.
 //
 // fn and its accumulator MUST be constructed fresh per Flush call. journal is
 // chunk-agnostic and cannot detect a violation: a carver hoisted to a
@@ -164,11 +170,12 @@ func (s *Store) Flush(ctx context.Context, id FileID, opts FlushOptions, fn Flus
 	runs := splitRuns(snap)
 	fnCalled := false
 	var firstErr error
+	var durable []Extent
 	for i, run := range runs {
 		if err := ctx.Err(); err != nil {
-			// Cancellation: stop offering, flip already-validated (done below
-			// each call), still call AfterFile. The cancelled context is the
-			// failure the caller sees — a partial flush must not read as
+			// Cancellation: stop offering and still publish reported credit
+			// through AfterFile. The cancelled context is the failure the
+			// caller sees — a partial flush must not read as
 			// complete, or the caller stops retrying with runs still dirty.
 			if firstErr == nil {
 				firstErr = err
@@ -187,12 +194,8 @@ func (s *Store) Flush(ctx context.Context, id FileID, opts FlushOptions, fn Flus
 			ReaderAt: &flushReader{s: s, sh: sh, id: id, ivs: run},
 		}
 		fnCalled = true
-		durable, err := fn(ctx, r)
-		// Flip the validated extents even when fn failed — "these committed,
-		// then I failed".
-		if ferr := s.flipReported(sh, id, snap, durable); ferr != nil && firstErr == nil {
-			firstErr = ferr
-		}
+		reported, err := fn(ctx, r)
+		durable = append(durable, reported...)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -201,17 +204,24 @@ func (s *Store) Flush(ctx context.Context, id FileID, opts FlushOptions, fn Flus
 		}
 	}
 
-	// AfterFile is mandatory and runs under the flush lock, whatever the
-	// outcome above. The reap cannot move outside the lock: releasing at
-	// Flush return lets the next pass commit rows inside this pass's
+	// AfterFile is mandatory and runs under the flush lock before durable
+	// credit, whatever the outcome above. The reap cannot move outside the lock:
+	// releasing at Flush return lets the next pass commit rows inside this pass's
 	// about-to-be-reaped span before the delayed reap lands. The context is
 	// detached from cancellation so a cancelled pass still reaps: a dead ctx
 	// would fail the metadata transaction and strand the rows the committed
 	// tiling superseded.
 	if fnCalled && opts.AfterFile != nil {
-		if aerr := opts.AfterFile(context.WithoutCancel(ctx), id); aerr != nil && firstErr == nil {
-			firstErr = aerr
+		if aerr := opts.AfterFile(context.WithoutCancel(ctx), id); aerr != nil {
+			return errors.Join(firstErr, aerr)
 		}
+	}
+	// decision: a scattered multi-run pass retains earlier runs' dirty credit
+	// until the final reap succeeds. This delays clean-byte accounting but keeps
+	// authoritative local bytes resident across publication errors. Per-run
+	// credit would require a corresponding per-run publication guarantee.
+	if ferr := s.flipReported(sh, id, snap, durable); ferr != nil {
+		firstErr = errors.Join(firstErr, ferr)
 	}
 	s.maybeResetDirtyClock(sh, id)
 	return firstErr

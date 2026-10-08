@@ -86,8 +86,8 @@ type shard struct {
 	// across its whole pass but only grabs mu briefly to snapshot and flip.
 	flushMu sync.Mutex
 	// flushing identifies the one file whose pass owns flushMu. Both fields
-	// are guarded by mu and stay set through manifest publication and reap,
-	// even after the last interval has been marked synced.
+	// are guarded by mu and stay set through manifest publication, reap and
+	// the final application of durable credit.
 	flushing   bool
 	flushingID FileID
 	// reclaimQueued is true while a background reclaim for this shard waits for

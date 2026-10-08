@@ -136,9 +136,9 @@ func (s *Store) Extents(ctx context.Context, id FileID) ([]Extent, error) {
 }
 
 // HasDirty reports dirty intervals or a flush still publishing its manifest.
-// The publication guard includes AfterFile: synced bytes can still have stale
-// interior rows awaiting reap. Writes newer than the flush snapshot remain
-// dirty after the pass ends and are included in the answer as well.
+// The publication guard includes AfterFile, and reported bytes stay dirty until
+// that callback succeeds. Failed publication and writes newer than the flush
+// snapshot remain dirty after the pass ends and are included in the answer.
 func (s *Store) HasDirty(ctx context.Context, id FileID) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
