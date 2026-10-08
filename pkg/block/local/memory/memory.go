@@ -35,40 +35,70 @@ type memFile struct {
 	buf      []byte
 	unsynced int64
 	written  [][2]int64
+	dirty    [][2]int64
 	version  uint64
 }
 
 // addWritten records [start, end) as written, coalescing it with any range it
 // overlaps or abuts so the slice stays sorted and non-overlapping.
 func (f *memFile) addWritten(start, end int64) {
+	f.written = addRange(f.written, start, end)
+}
+
+func addRange(ranges [][2]int64, start, end int64) [][2]int64 {
 	if end <= start {
-		return
+		return ranges
 	}
-	out := make([][2]int64, 0, len(f.written)+1)
+	out := make([][2]int64, 0, len(ranges)+1)
 	i := 0
-	for ; i < len(f.written) && f.written[i][1] < start; i++ {
-		out = append(out, f.written[i])
+	for ; i < len(ranges) && ranges[i][1] < start; i++ {
+		out = append(out, ranges[i])
 	}
-	for ; i < len(f.written) && f.written[i][0] <= end; i++ {
-		start = min(start, f.written[i][0])
-		end = max(end, f.written[i][1])
+	for ; i < len(ranges) && ranges[i][0] <= end; i++ {
+		start = min(start, ranges[i][0])
+		end = max(end, ranges[i][1])
 	}
 	out = append(out, [2]int64{start, end})
-	f.written = append(out, f.written[i:]...)
+	return append(out, ranges[i:]...)
 }
 
 // clipWritten drops the recorded ranges past newSize and trims a straddling
 // one, keeping the record consistent with the shortened buffer.
 func (f *memFile) clipWritten(newSize int64) {
-	out := f.written[:0]
-	for _, e := range f.written {
+	f.written = clipRanges(f.written, newSize)
+}
+
+func clipRanges(ranges [][2]int64, newSize int64) [][2]int64 {
+	out := ranges[:0]
+	for _, e := range ranges {
 		if e[0] >= newSize {
 			continue
 		}
 		out = append(out, [2]int64{e[0], min(e[1], newSize)})
 	}
-	f.written = out
+	return out
 }
+
+func rangeBytes(ranges [][2]int64) int64 {
+	var n int64
+	for _, r := range ranges {
+		n += r[1] - r[0]
+	}
+	return n
+}
+
+type fenceEntry struct {
+	id       string
+	version  uint64
+	survives int64
+}
+
+const maxHydrateFences = 1024
+
+// ErrHydrateHistoryExpired means a fetch predates the retained mutation
+// history. Refusing the fill avoids returning holes as successful zero data;
+// retrying the read or warm operation samples a current WriteVersion.
+var ErrHydrateHistoryExpired = errors.New("memory: hydrate plan predates retained mutation history")
 
 // MemoryStore is a pure in-memory implementation of local.LocalStore.
 type MemoryStore struct {
@@ -77,15 +107,24 @@ type MemoryStore struct {
 	// Flush locks belong to file IDs, not memFile instances, so deleting and
 	// recreating a file cannot let its new pass overtake an older callback.
 	flushLocks [64]sync.Mutex
+	// These outlive a file's buffer: a delayed fetch must not fill holes that
+	// truncate or delete created, including after that file ID is reused.
+	fences     map[string]uint64
+	fenceOrder []fenceEntry
+	fenceFloor uint64
+	flushing   map[string]bool
 
 	unsynced atomic.Int64
+	version  atomic.Uint64
 	durable  atomic.Bool
 	closed   bool
 }
 
 // New creates an empty MemoryStore.
 func New() *MemoryStore {
-	return &MemoryStore{files: make(map[string]*memFile)}
+	return &MemoryStore{
+		files: make(map[string]*memFile), fences: make(map[string]uint64), flushing: make(map[string]bool),
+	}
 }
 
 // writeLocked copies data into the file's buffer at offset, growing (zero-filling
@@ -106,46 +145,134 @@ func (s *MemoryStore) writeLocked(payloadID string, offset int64, data []byte) i
 	}
 	copy(f.buf[offset:end], data)
 	f.addWritten(offset, end)
-	f.version++
+	f.version = s.version.Add(1)
 	return int64(len(data))
 }
 
 // WriteAt buffers a dirty write.
-func (s *MemoryStore) WriteAt(_ context.Context, id journal.FileID, offset int64, data []byte) error {
+func (s *MemoryStore) WriteAt(ctx context.Context, id journal.FileID, offset int64, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	payloadID := string(id)
 	if offset < 0 {
 		return block.ErrInvalidOffset
+	}
+	if int64(len(data)) > math.MaxInt64-offset {
+		return block.ErrInvalidSize
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return block.ErrStoreClosed
 	}
-	n := s.writeLocked(payloadID, offset, data)
-	s.files[payloadID].unsynced += n
-	s.unsynced.Add(n)
+	if len(data) == 0 {
+		return nil
+	}
+	s.writeLocked(payloadID, offset, data)
+	f := s.files[payloadID]
+	f.dirty = addRange(f.dirty, offset, offset+int64(len(data)))
+	s.updateDirty(f)
 	return nil
 }
 
-// Hydrate writes remote-fetched bytes; born clean, so no unsynced charge.
-//
-// ponytail: notAfter is accepted and ignored — the per-file record tracks which
-// ranges were written but stamps no version on them, so there is nothing to
-// compare it against, and this store never evicts, so the cold read that
-// carries a meaningful mark does not arise here. Version the recorded ranges if
-// a memory-local share ever needs the gate.
-func (s *MemoryStore) Hydrate(_ context.Context, id journal.FileID, offset int64, data []byte, _ uint64) error {
+// Hydrate fills only absent ranges. Resident bytes are authoritative even when
+// the fetch carries the current version, and retained mutation fences reject
+// older fills of holes left by truncate or delete. Filled bytes are born clean.
+func (s *MemoryStore) Hydrate(ctx context.Context, id journal.FileID, offset int64, data []byte, notAfter uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	payloadID := string(id)
 	if offset < 0 {
 		return block.ErrInvalidOffset
+	}
+	if int64(len(data)) > math.MaxInt64-offset {
+		return block.ErrInvalidSize
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return block.ErrStoreClosed
 	}
-	s.writeLocked(payloadID, offset, data)
+	end := offset + int64(len(data))
+	if len(data) == 0 {
+		return nil
+	}
+	if f := s.files[payloadID]; f != nil && coversRange(f.written, offset, end) {
+		return nil // A no-op refill needs no retained mutation history.
+	}
+	if notAfter < s.fenceFloor {
+		return ErrHydrateHistoryExpired
+	}
+	if notAfter < s.fences[payloadID] {
+		// Keep every prefix that survived mutations after this plan. Dropping a
+		// straddling fill whole would turn still-valid remote prefix bytes into
+		// zero-filled holes. Older fences do not constrain a newer plan.
+		for _, fence := range s.fenceOrder {
+			if fence.id == payloadID && fence.version > notAfter {
+				end = min(end, fence.survives)
+			}
+		}
+	}
+	if end <= offset {
+		return nil
+	}
+	// Plan against the same locked ranges that the fill updates. A concurrent
+	// writer cannot land between choosing a gap and copying remote bytes into it.
+	var gaps [][2]int64
+	cursor := offset
+	if f := s.files[payloadID]; f != nil {
+		for _, r := range f.written {
+			if r[1] <= cursor {
+				continue
+			}
+			if r[0] >= end {
+				break
+			}
+			if r[0] > cursor {
+				gaps = append(gaps, [2]int64{cursor, r[0]})
+			}
+			cursor = max(cursor, r[1])
+		}
+	}
+	if cursor < end {
+		gaps = append(gaps, [2]int64{cursor, end})
+	}
+	for _, gap := range gaps {
+		s.writeLocked(payloadID, gap[0], data[gap[0]-offset:gap[1]-offset])
+	}
 	return nil
+}
+
+// updateDirty publishes the delta in live dirty ranges. Caller holds mu.
+func (s *MemoryStore) updateDirty(f *memFile) {
+	n := rangeBytes(f.dirty)
+	s.unsynced.Add(n - f.unsynced)
+	f.unsynced = n
+}
+
+// rememberFence retains each mutation's cleared range for a file ID.
+// Mutations are atomic under mu, so a bound at the completed mutation's version
+// may fill again; every older bound remains fenced, including initial zero.
+//
+// ponytail: keep a bounded FIFO of mutation fences. Evicted versions raise a
+// global floor, conservatively refusing old fills for other files too. Those
+// reads or warm runs must retry with a fresh plan; without cold ranges, silently
+// dropping a fill would instead serve zeros. Track active fetch versions if
+// mutation churn makes those retries costly.
+func (s *MemoryStore) rememberFence(id string, version uint64, survives int64) {
+	s.fences[id] = version
+	s.fenceOrder = append(s.fenceOrder, fenceEntry{id: id, version: version, survives: survives})
+	if len(s.fenceOrder) > maxHydrateFences {
+		oldest := s.fenceOrder[0]
+		s.fenceOrder[0] = fenceEntry{}
+		s.fenceOrder = s.fenceOrder[1:]
+		if s.fences[oldest.id] == oldest.version {
+			delete(s.fences, oldest.id)
+		}
+		s.fenceFloor = max(s.fenceFloor, oldest.version)
+	}
 }
 
 // ReadAt copies bytes into dst; never-written ranges are zero-filled holes.
@@ -223,8 +350,12 @@ func (s *MemoryStore) IsRangeResident(ctx context.Context, id journal.FileID, of
 	if f == nil {
 		return false, nil
 	}
-	i := sort.Search(len(f.written), func(i int) bool { return f.written[i][1] > offset })
-	return i < len(f.written) && f.written[i][0] <= offset && f.written[i][1] >= offset+length, nil
+	return coversRange(f.written, offset, offset+length), nil
+}
+
+func coversRange(ranges [][2]int64, start, end int64) bool {
+	i := sort.Search(len(ranges), func(i int) bool { return ranges[i][1] > start })
+	return i < len(ranges) && ranges[i][0] <= start && ranges[i][1] >= end
 }
 
 // Commit is a no-op: memory has no durable substrate.
@@ -272,28 +403,47 @@ func (s *MemoryStore) DataExtents(_ context.Context, id journal.FileID, fileSize
 }
 
 // Truncate shrinks a file to newSize; growing is a no-op.
-func (s *MemoryStore) Truncate(_ context.Context, id journal.FileID, newSize int64) error {
+func (s *MemoryStore) Truncate(ctx context.Context, id journal.FileID, newSize int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	payloadID := string(id)
 	if newSize < 0 {
 		return block.ErrInvalidOffset
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return block.ErrStoreClosed
+	}
+	// Memory has no cold markers, so an absent local tail can still have a
+	// remote fetch in flight. Fence the requested tail even without a buffer.
+	version := s.version.Add(1)
+	s.rememberFence(payloadID, version, newSize)
 	f := s.files[payloadID]
 	if f == nil || int64(len(f.buf)) <= newSize {
 		return nil
 	}
 	f.buf = f.buf[:newSize]
 	f.clipWritten(newSize)
-	f.version++
+	f.dirty = clipRanges(f.dirty, newSize)
+	s.updateDirty(f)
+	f.version = version
 	return nil
 }
 
 // Delete drops all of a file's cached ranges.
-func (s *MemoryStore) Delete(_ context.Context, id journal.FileID) error {
+func (s *MemoryStore) Delete(ctx context.Context, id journal.FileID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	payloadID := string(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return block.ErrStoreClosed
+	}
+	s.rememberFence(payloadID, s.version.Add(1), 0)
 	if f := s.files[payloadID]; f != nil {
 		s.unsynced.Add(-f.unsynced)
 		delete(s.files, payloadID)
@@ -340,18 +490,20 @@ func (s *MemoryStore) Flush(ctx context.Context, id journal.FileID, opts journal
 
 	var firstErr error
 	for _, fid := range ids {
-		s.mu.RLock()
+		s.mu.Lock()
 		f := s.files[fid]
 		var data []byte
 		var version uint64
-		if f != nil {
+		if f != nil && len(f.buf) > 0 {
 			data = append([]byte(nil), f.buf...)
 			version = f.version
+			s.flushing[fid] = true
 		}
-		s.mu.RUnlock()
+		s.mu.Unlock()
 		if len(data) == 0 {
 			continue
 		}
+		defer s.finishFlush(fid)
 		// Offer the whole dirty file as one run. Credit applies only to this
 		// snapshot: a concurrent mutation leaves the file dirty for another pass.
 		extents, ferr := fn(ctx, journal.Run{
@@ -360,12 +512,27 @@ func (s *MemoryStore) Flush(ctx context.Context, id journal.FileID, opts journal
 			Final:    true,
 			ReaderAt: bytes.NewReader(data),
 		})
-		s.markCarvedSnapshot(fid, f, version, int64(len(data)), extents)
+		// Manifest cleanup belongs to the serialized pass. Until it succeeds,
+		// retain dirty bytes so retry can reconstruct and reap the same rows.
+		var cleanupErr error
+		if opts.AfterFile != nil {
+			cleanupErr = opts.AfterFile(context.WithoutCancel(ctx), journal.FileID(fid))
+		}
+		if cleanupErr == nil {
+			s.markCarvedSnapshot(fid, f, version, int64(len(data)), extents)
+		}
+		ferr = errors.Join(ferr, cleanupErr)
 		if ferr != nil && firstErr == nil {
 			firstErr = ferr
 		}
 	}
 	return firstErr
+}
+
+func (s *MemoryStore) finishFlush(id string) {
+	s.mu.Lock()
+	delete(s.flushing, id)
+	s.mu.Unlock()
 }
 
 // acquireFlush serializes a file's snapshot, sink callback, and dirty credit.
@@ -401,10 +568,10 @@ func (s *MemoryStore) acquireFlush(ctx context.Context, id journal.FileID) (func
 
 // markCarvedSnapshot clears only a fully durable, unchanged snapshot.
 //
-// ponytail: memory keeps a dirty byte count, not versioned dirty ranges. A
-// partial report cannot identify which charged bytes it covered, so it leaves
-// the whole file dirty and the next pass may re-offer durable bytes. Track dirty
-// ranges if partial-progress efficiency becomes necessary for this local tier.
+// ponytail: one version fences the whole file, so partial reports leave all
+// dirty ranges for retry. Per-range versions would let a pass credit unchanged
+// fragments even when another write arrived; add them if that efficiency is
+// necessary for this local tier.
 func (s *MemoryStore) markCarvedSnapshot(fid string, snapshot *memFile, version uint64, size int64, extents []journal.Extent) {
 	var spans [][2]int64
 	for _, e := range extents {
@@ -431,6 +598,7 @@ func (s *MemoryStore) markCarvedSnapshot(fid string, snapshot *memFile, version 
 	}
 	s.unsynced.Add(-f.unsynced)
 	f.unsynced = 0
+	f.dirty = nil
 }
 
 // UnsyncedBytes reports bytes not yet carved to the sink.
@@ -441,8 +609,7 @@ func (s *MemoryStore) UnsyncedBytes() int64 {
 	return 0
 }
 
-// HasDirty reports pending bytes for this file. A fully truncated file has no
-// bytes to offer, even when its old unsynced accounting has not been drained.
+// HasDirty reports live bytes or an active pass still awaiting publication.
 func (s *MemoryStore) HasDirty(ctx context.Context, id journal.FileID) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -453,7 +620,7 @@ func (s *MemoryStore) HasDirty(ctx context.Context, id journal.FileID) (bool, er
 		return false, block.ErrStoreClosed
 	}
 	f := s.files[string(id)]
-	return f != nil && len(f.buf) > 0 && f.unsynced > 0, nil
+	return s.flushing[string(id)] || (f != nil && f.unsynced > 0), nil
 }
 
 // Evict is a no-op: memory never evicts.
@@ -511,9 +678,9 @@ func (s *MemoryStore) Durable() bool { return s.durable.Load() }
 // SetDurable overrides the durability report.
 func (s *MemoryStore) SetDurable(v bool) { s.durable.Store(v) }
 
-// WriteVersion reports zero because this test tier keeps no write history.
-// Its Hydrate ignores bounds; unlike the journal, it cannot fence later writes.
-func (s *MemoryStore) WriteVersion() uint64 { return 0 }
+// WriteVersion reports the latest local mutation, including retained fences
+// for files whose bytes truncate or delete removed.
+func (s *MemoryStore) WriteVersion() uint64 { return s.version.Load() }
 
 // Invalidate is a no-op: the memory store has no durable tier to demote and no
 // remote copy to fall back to, so there is nothing a read could fetch instead.
@@ -548,7 +715,7 @@ func (s *MemoryStore) BlockSize() int64       { return 0 }
 
 // JournalVersion reports no watermark. The store keeps no log: a write lands in
 // the buffer in place and leaves no record behind it, so there is no point in
-// time to number. Same reason WriteVersion reports 0.
+// time to restore. WriteVersion fences live cache fills but retains no history.
 func (s *MemoryStore) JournalVersion() uint64 { return 0 }
 
 // SetPinVersion does nothing.

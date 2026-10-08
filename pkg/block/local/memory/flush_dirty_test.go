@@ -51,8 +51,8 @@ func TestFlushSnapshotCannotClearConcurrentMutation(t *testing.T) {
 					err = s.WriteAt(ctx, "file", 0, bytes.Repeat([]byte{wantByte}, wantSize))
 				}
 				if err == nil {
-					// Two writes give the new file the same local version as the
-					// retired snapshot; its identity must fence the old completion.
+					// More than one write may land on the recreated ID before the
+					// retired snapshot completes; none belongs to the old pass.
 					err = s.WriteAt(ctx, "file", 0, []byte{wantByte})
 				}
 			case "truncate":
@@ -201,5 +201,83 @@ func TestFlushSerializesAcrossConcurrentMutation(t *testing.T) {
 				t.Fatalf("flush publication order: %v", order)
 			}
 		})
+	}
+}
+
+func TestFlushRetainsDirtyDataUntilAfterFileSucceeds(t *testing.T) {
+	for _, panicCleanup := range []bool{false, true} {
+		name := "error"
+		if panicCleanup {
+			name = "panic"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, s := context.Background(), New()
+			if err := s.WriteAt(ctx, "file", 0, []byte("data")); err != nil {
+				t.Fatal(err)
+			}
+			cleanupFailure := errors.New("cleanup failed")
+			var err error
+			var recovered any
+			called := false
+			func() {
+				defer func() { recovered = recover() }()
+				err = s.Flush(ctx, "file", journal.FlushOptions{AfterFile: func(ctx context.Context, id journal.FileID) error {
+					called = true
+					if dirty, err := s.HasDirty(ctx, id); err != nil || !dirty || s.UnsyncedBytes() != 4 {
+						t.Errorf("cleanup began after dirty credit: dirty=%v bytes=%d error=%v", dirty, s.UnsyncedBytes(), err)
+					}
+					if panicCleanup {
+						panic(cleanupFailure)
+					}
+					return cleanupFailure
+				}}, func(_ context.Context, run journal.Run) ([]journal.Extent, error) {
+					return []journal.Extent{run.Extent}, nil
+				})
+			}()
+			if !called || (panicCleanup && recovered != cleanupFailure) || (!panicCleanup && !errors.Is(err, cleanupFailure)) {
+				t.Fatalf("cleanup outcome: called=%v panic=%v error=%v", called, recovered, err)
+			}
+			if dirty, err := s.HasDirty(ctx, "file"); err != nil || !dirty || s.UnsyncedBytes() != 4 {
+				t.Fatalf("failed cleanup lost retry data: dirty=%v bytes=%d error=%v", dirty, s.UnsyncedBytes(), err)
+			}
+			if err := s.Flush(ctx, "file", journal.FlushOptions{}, func(_ context.Context, run journal.Run) ([]journal.Extent, error) {
+				return []journal.Extent{run.Extent}, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if dirty, err := s.HasDirty(ctx, "file"); err != nil || dirty || s.UnsyncedBytes() != 0 {
+				t.Fatalf("successful retry remains dirty: dirty=%v bytes=%d error=%v", dirty, s.UnsyncedBytes(), err)
+			}
+		})
+	}
+}
+
+func TestFlushCleanupRemainsActiveAfterConcurrentTruncate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := New()
+	if err := s.WriteAt(ctx, "file", 0, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	err := s.Flush(ctx, "file", journal.FlushOptions{AfterFile: func(cleanupCtx context.Context, id journal.FileID) error {
+		if err := cleanupCtx.Err(); err != nil {
+			t.Fatalf("cleanup inherited cancelled request: %v", err)
+		}
+		if err := s.Truncate(cleanupCtx, id, 0); err != nil {
+			return err
+		}
+		if dirty, err := s.HasDirty(cleanupCtx, id); err != nil || !dirty {
+			t.Fatalf("active cleanup became invisible after truncate: dirty=%v error=%v", dirty, err)
+		}
+		return nil
+	}}, func(_ context.Context, run journal.Run) ([]journal.Extent, error) {
+		cancel()
+		return []journal.Extent{run.Extent}, context.Canceled
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("flush lost original failure: %v", err)
+	}
+	if dirty, err := s.HasDirty(context.Background(), "file"); err != nil || dirty || s.UnsyncedBytes() != 0 {
+		t.Fatalf("finished empty file remains dirty: dirty=%v bytes=%d error=%v", dirty, s.UnsyncedBytes(), err)
 	}
 }
